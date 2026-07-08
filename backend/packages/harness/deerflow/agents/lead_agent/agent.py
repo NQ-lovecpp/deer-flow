@@ -511,11 +511,17 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
     skills_for_tool_policy = _load_enabled_skills_for_tool_policy(available_skills, app_config=resolved_app_config, user_id=resolved_user_id)
 
     if is_bootstrap:
-        # Special bootstrap agent with minimal prompt for initial custom agent creation flow
-        # Keep the bootstrap skill set intentionally narrow so agent creation
+        # Special bootstrap agent with minimal prompt for initial custom agent creation flow.
+        # Keep the bootstrap tool set intentionally narrow so agent creation
         # remains deterministic before the custom agent's own config exists.
-        raw_tools = get_available_tools(model_name=model_name, subagent_enabled=subagent_enabled, app_config=resolved_app_config) + [setup_agent]
+        # In particular, do not expose skill_manage here: custom skills are not
+        # custom agents, and exposing both skill_manage and setup_agent lets the
+        # model persist the new agent into skills/custom instead of agents/.
+        from deerflow.sandbox.tools import read_file_tool
+
+        raw_tools = [read_file_tool, setup_agent]
         filtered = filter_tools_by_skill_allowed_tools(raw_tools, skills_for_tool_policy, always_allowed_tool_names=SKILL_LOADING_TOOL_NAMES)
+        logger.info("Bootstrap tools: %s", ", ".join(tool.name for tool in filtered))
         final_tools, setup = assemble_deferred_tools(filtered, enabled=resolved_app_config.tool_search.enabled)
         return create_agent(
             model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, app_config=resolved_app_config, attach_tracing=False),

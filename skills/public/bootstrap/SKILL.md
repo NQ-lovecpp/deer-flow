@@ -33,6 +33,7 @@ bootstrap/
 - **Progressive warmth.** Each round should feel more informed than the last. By Phase 3, the user should feel understood.
 - **Adapt pacing.** Terse user → probe with warmth. Verbose user → acknowledge, distill, advance.
 - **Never expose the template.** The user is having a conversation, not filling out a form.
+- Custom skills are not custom agents. During agent creation, never use `skill_manage`; only `setup_agent` persists a managed custom agent.
 
 ## Conversation Phases
 
@@ -90,5 +91,5 @@ Once you have enough information:
 - Voice must match the user. Blunt user → blunt SOUL.md. Expressive user → let it breathe.
 - Total SOUL.md should be under 300 words. Density over length.
 - Growth section is mandatory and mostly fixed (see template).
-- You **must** call `setup_agent` — do not write the file manually with bash tools.
+- You **must** call `setup_agent` — do not write the file manually with bash tools and do not create or edit custom skills.
 - If `setup_agent` returns an error, report it to the user and do not claim success.

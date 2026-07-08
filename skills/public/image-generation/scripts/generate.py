@@ -1,13 +1,25 @@
 import base64
 import json
 import os
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import urlencode
 
 import requests
 
 MINIMAX_DEFAULT_HOST = "https://api.minimaxi.com"
+COMFY_DEFAULT_HOST = "http://host.docker.internal:8188"
 # MiniMax image-01 caps the prompt at 1500 characters and rejects longer requests
 # with a generic "invalid params" error, so validate before calling the API.
 MINIMAX_PROMPT_MAX_CHARS = 1500
+
+QWEN_EDIT_PRESETS = {
+    "fast": {"steps": 4, "cfg": 1.0, "denoise": 1.0, "megapixels": 0.5, "weight_dtype": "default", "use_lora": True},
+    "balanced": {"steps": 20, "cfg": 2.5, "denoise": 1.0, "megapixels": 0.5, "weight_dtype": "default", "use_lora": False},
+    "quality": {"steps": 40, "cfg": 4.0, "denoise": 1.0, "megapixels": 1.0, "weight_dtype": "default", "use_lora": False},
+}
+
 
 
 def validate_image(image_path: str) -> bool:
@@ -39,10 +51,10 @@ def _resolve_provider(override_env: str, existing_provider: str, has_existing_cr
         return existing_provider
     if os.getenv("MINIMAX_API_KEY"):
         return "minimax"
-    raise ValueError(
-        f"No credentials found. Set GEMINI_API_KEY for {existing_provider}, "
-        f"or MINIMAX_API_KEY for minimax (optionally force with {override_env})."
-    )
+    # Prefer local ComfyUI when no remote credentials are configured. The
+    # concrete local workflow is selected later from the request shape: reference
+    # images use Qwen Image Edit, while pure text-to-image uses the SD fallback.
+    return "comfy"
 
 
 def _minimax_host() -> str:
@@ -191,38 +203,394 @@ def _generate_image_gemini(
     raise Exception("Failed to generate image")
 
 
+
+def _comfy_host() -> str:
+    return os.getenv("COMFYUI_URL", COMFY_DEFAULT_HOST).rstrip("/")
+
+
+def _comfy_prompt_text(raw: str) -> tuple[str, str]:
+    text = raw.strip()
+    negative = "blurry, low quality, distorted, deformed, watermark, text artifacts"
+    try:
+        data = json.loads(text)
+    except (ValueError, json.JSONDecodeError):
+        return text, negative
+    if not isinstance(data, dict):
+        return text, negative
+    prompt = data.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        parts = []
+        for key in ("subject", "style", "composition", "lighting", "color_palette", "background"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+        prompt = ", ".join(parts) if parts else text
+    neg = data.get("negative_prompt")
+    if isinstance(neg, str) and neg.strip():
+        negative = neg.strip()
+    return prompt.strip(), negative
+
+
+def _comfy_dimensions(aspect_ratio: str) -> tuple[int, int]:
+    mapping = {
+        "1:1": (512, 512),
+        "16:9": (768, 432),
+        "9:16": (432, 768),
+        "4:3": (704, 528),
+        "3:4": (528, 704),
+        "3:2": (768, 512),
+        "2:3": (512, 768),
+    }
+    return mapping.get(aspect_ratio, mapping["1:1"])
+
+def _qwen_blank_dimensions(aspect_ratio: str) -> tuple[int, int]:
+    base_w, base_h = _comfy_dimensions(aspect_ratio)
+    target_pixels = 1024 * 1024
+    scale = (target_pixels / float(base_w * base_h)) ** 0.5
+    width = max(8, round(base_w * scale / 8) * 8)
+    height = max(8, round(base_h * scale / 8) * 8)
+    return width, height
+
+
+def _create_qwen_blank_reference(aspect_ratio: str, output_file: str) -> str:
+    from PIL import Image, ImageDraw
+
+    width, height = _qwen_blank_dimensions(aspect_ratio)
+    blank_dir = Path(output_file).parent if output_file else Path("/tmp")
+    blank_dir.mkdir(parents=True, exist_ok=True)
+    blank_path = blank_dir / f"qwen_blank_reference_{uuid.uuid4().hex[:12]}.png"
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    # A tiny low-contrast guide mark helps image-edit models understand this is
+    # an editable canvas, while staying visually negligible for logo/poster work.
+    mark = max(2, min(width, height) // 128)
+    draw.rectangle((0, 0, mark, mark), fill=(250, 250, 250))
+    image.save(blank_path)
+    return str(blank_path)
+
+
+def _build_comfy_sd15_workflow(prompt: str, negative: str, aspect_ratio: str) -> dict:
+    width, height = _comfy_dimensions(aspect_ratio)
+    ckpt = os.getenv("COMFYUI_CHECKPOINT", "v1-5-pruned-emaonly-fp16.safetensors")
+    steps = int(os.getenv("COMFYUI_STEPS", "20"))
+    cfg = float(os.getenv("COMFYUI_CFG", "7.0"))
+    sampler = os.getenv("COMFYUI_SAMPLER", "euler")
+    scheduler = os.getenv("COMFYUI_SCHEDULER", "normal")
+    seed = int(os.getenv("COMFYUI_SEED", "0")) or int(time.time() * 1000) % 18446744073709551615
+    prefix = f"deerflow_{uuid.uuid4().hex[:12]}"
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["1", 1]}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
+        "4": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+        "5": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "seed": seed, "steps": steps, "cfg": cfg, "sampler_name": sampler, "scheduler": scheduler, "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0], "denoise": 1.0}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": prefix}},
+    }
+
+
+
+def _comfy_upload_image(image_path: str) -> str:
+    host = _comfy_host()
+    with open(image_path, "rb") as f:
+        response = requests.post(
+            f"{host}/upload/image",
+            files={"image": (Path(image_path).name, f, _guess_mime(image_path))},
+            data={"type": "input", "overwrite": "true"},
+            timeout=120,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    name = payload.get("name") or payload.get("filename")
+    subfolder = payload.get("subfolder") or ""
+    return f"{subfolder}/{name}" if subfolder else name
+
+
+
+def _parse_bool(value: str | bool | None) -> bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
+
+
+def _qwen_option(options: dict | None, key: str, env_name: str, default, cast):
+    if options and options.get(key) is not None:
+        return cast(options[key])
+    env_value = os.getenv(env_name)
+    if env_value is not None and env_value != "":
+        return cast(env_value)
+    return default
+
+
+def _resolve_qwen_edit_options(options: dict | None = None) -> dict:
+    preset = (options or {}).get("preset") or os.getenv("COMFYUI_QWEN_PRESET", "balanced")
+    preset = str(preset).strip().lower()
+    if preset not in QWEN_EDIT_PRESETS:
+        raise ValueError(f"Unknown Qwen preset: {preset!r} (use fast, balanced, or quality)")
+    defaults = QWEN_EDIT_PRESETS[preset]
+
+    env_use_lora = _parse_bool(os.getenv("COMFYUI_QWEN_USE_LORA"))
+    requested_use_lora = (options or {}).get("use_lora") if options else None
+    if requested_use_lora is not None:
+        use_lora = bool(requested_use_lora)
+    elif env_use_lora is not None:
+        use_lora = env_use_lora
+    else:
+        use_lora = defaults["use_lora"]
+
+    seed_value = None
+    if options and options.get("seed") is not None:
+        seed_value = options["seed"]
+    elif os.getenv("COMFYUI_QWEN_SEED"):
+        seed_value = os.getenv("COMFYUI_QWEN_SEED")
+    elif os.getenv("COMFYUI_SEED"):
+        seed_value = os.getenv("COMFYUI_SEED")
+    seed = int(seed_value) if seed_value not in (None, "", "0", 0) else int(time.time() * 1000) % 18446744073709551615
+
+    if options and options.get("megapixels") is not None:
+        megapixels = float(options["megapixels"])
+    elif os.getenv("COMFYUI_QWEN_MEGAPIXELS"):
+        megapixels = float(os.getenv("COMFYUI_QWEN_MEGAPIXELS", "0"))
+    else:
+        megapixels = float(defaults["megapixels"])
+    if megapixels <= 0:
+        megapixels = None
+
+    return {
+        "preset": preset,
+        "unet": os.getenv("COMFYUI_QWEN_UNET", "qwen_image_edit_2509_fp8_e4m3fn.safetensors"),
+        "clip": os.getenv("COMFYUI_QWEN_CLIP", "qwen_2.5_vl_7b_fp8_scaled.safetensors"),
+        "vae": os.getenv("COMFYUI_QWEN_VAE", "qwen_image_vae.safetensors"),
+        "lora_name": _qwen_option(options, "lora_name", "COMFYUI_QWEN_LORA", "Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors", str),
+        "lora_strength": _qwen_option(options, "lora_strength", "COMFYUI_QWEN_LORA_STRENGTH", 1.0, float),
+        "use_lora": use_lora,
+        "weight_dtype": _qwen_option(options, "weight_dtype", "COMFYUI_QWEN_WEIGHT_DTYPE", defaults["weight_dtype"], str),
+        "steps": _qwen_option(options, "steps", "COMFYUI_QWEN_STEPS", defaults["steps"], int),
+        "cfg": _qwen_option(options, "cfg", "COMFYUI_QWEN_CFG", defaults["cfg"], float),
+        "denoise": _qwen_option(options, "denoise", "COMFYUI_QWEN_DENOISE", defaults["denoise"], float),
+        "shift": _qwen_option(options, "shift", "COMFYUI_QWEN_SHIFT", 3.0, float),
+        "megapixels": megapixels,
+        "sampler": _qwen_option(options, "sampler", "COMFYUI_QWEN_SAMPLER", "euler", str),
+        "scheduler": _qwen_option(options, "scheduler", "COMFYUI_QWEN_SCHEDULER", "simple", str),
+        "seed": seed,
+    }
+
+
+def _build_comfy_qwen_edit_workflow(prompt: str, uploaded_images: list[str], qwen_options: dict | None = None, negative: str = "") -> dict:
+    if not uploaded_images:
+        raise ValueError("Qwen Image Edit requires at least one uploaded reference image.")
+
+    opts = _resolve_qwen_edit_options(qwen_options)
+    prefix = f"deerflow_qwen_edit_{uuid.uuid4().hex[:12]}"
+    workflow: dict[str, dict] = {}
+
+    def add(class_type: str, inputs: dict) -> str:
+        node_id = str(len(workflow) + 1)
+        workflow[node_id] = {"class_type": class_type, "inputs": inputs}
+        return node_id
+
+    image_refs = []
+    for uploaded_image in uploaded_images[:3]:
+        image_id = add("LoadImage", {"image": uploaded_image})
+        if opts["megapixels"] is not None:
+            image_id = add(
+                "ImageScaleToTotalPixels",
+                {
+                    "image": [image_id, 0],
+                    "upscale_method": "lanczos",
+                    "megapixels": opts["megapixels"],
+                    "resolution_steps": 1,
+                },
+            )
+        image_refs.append([image_id, 0])
+
+    unet_id = add("UNETLoader", {"unet_name": opts["unet"], "weight_dtype": opts["weight_dtype"]})
+    model_ref = [unet_id, 0]
+    if opts["use_lora"]:
+        lora_id = add(
+            "LoraLoaderModelOnly",
+            {"model": model_ref, "lora_name": opts["lora_name"], "strength_model": opts["lora_strength"]},
+        )
+        model_ref = [lora_id, 0]
+
+    sampling_id = add("ModelSamplingAuraFlow", {"model": model_ref, "shift": opts["shift"]})
+    cfgnorm_id = add("CFGNorm", {"model": [sampling_id, 0], "strength": 1.0})
+    clip_id = add("CLIPLoader", {"clip_name": opts["clip"], "type": "qwen_image", "device": "default"})
+    vae_id = add("VAELoader", {"vae_name": opts["vae"]})
+
+    positive_inputs = {"clip": [clip_id, 0], "vae": [vae_id, 0], "prompt": prompt}
+    negative_inputs = {"clip": [clip_id, 0], "vae": [vae_id, 0], "prompt": negative or ""}
+    for index, image_ref in enumerate(image_refs, start=1):
+        positive_inputs[f"image{index}"] = image_ref
+        negative_inputs[f"image{index}"] = image_ref
+    positive_id = add("TextEncodeQwenImageEditPlus", positive_inputs)
+    negative_id = add("TextEncodeQwenImageEditPlus", negative_inputs)
+    latent_id = add("VAEEncode", {"pixels": image_refs[0], "vae": [vae_id, 0]})
+    sample_id = add(
+        "KSampler",
+        {
+            "model": [cfgnorm_id, 0],
+            "seed": opts["seed"],
+            "steps": opts["steps"],
+            "cfg": opts["cfg"],
+            "sampler_name": opts["sampler"],
+            "scheduler": opts["scheduler"],
+            "positive": [positive_id, 0],
+            "negative": [negative_id, 0],
+            "latent_image": [latent_id, 0],
+            "denoise": opts["denoise"],
+        },
+    )
+    decoded_id = add("VAEDecode", {"samples": [sample_id, 0], "vae": [vae_id, 0]})
+    add("SaveImage", {"images": [decoded_id, 0], "filename_prefix": prefix})
+    return workflow
+
+def _run_comfy_workflow(workflow: dict, output_file: str) -> str:
+    host = _comfy_host()
+    client_id = f"deerflow-{uuid.uuid4().hex}"
+    queued = requests.post(f"{host}/prompt", json={"prompt": workflow, "client_id": client_id}, timeout=30)
+    queued.raise_for_status()
+    prompt_id = queued.json()["prompt_id"]
+    deadline = time.time() + int(os.getenv("COMFYUI_TIMEOUT", "900"))
+    history = None
+    while time.time() < deadline:
+        resp = requests.get(f"{host}/history/{prompt_id}", timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if prompt_id in data:
+            history = data[prompt_id]
+            break
+        time.sleep(1)
+    if history is None:
+        raise TimeoutError(f"Timed out waiting for ComfyUI prompt {prompt_id}")
+    status = history.get("status") or {}
+    if status.get("status_str") == "error":
+        messages = status.get("messages") or []
+        raise Exception(f"ComfyUI workflow failed: {messages[-1] if messages else status}")
+    outputs = history.get("outputs") or {}
+    images = []
+    for node in outputs.values():
+        images.extend(node.get("images") or [])
+    if not images:
+        raise Exception(f"ComfyUI generated no images")
+    image = images[0]
+    query = urlencode({"filename": image["filename"], "subfolder": image.get("subfolder", ""), "type": image.get("type", "output")})
+    img_resp = requests.get(f"{host}/view?{query}", timeout=60)
+    img_resp.raise_for_status()
+    _ensure_output_dir(output_file)
+    Path(output_file).write_bytes(img_resp.content)
+    return image["filename"]
+
+
+
+def _generate_image_comfy_qwen_edit(prompt: str, reference_images: list[str], output_file: str, aspect_ratio: str, qwen_options: dict | None = None) -> str:
+    prompt_text, negative = _comfy_prompt_text(prompt)
+    effective_reference_images = list(reference_images)
+    if not effective_reference_images:
+        raise ValueError(
+            "Qwen Image Edit requires at least one reference image. "
+            "For pure text-to-image generation, use IMAGE_GENERATION_PROVIDER=comfy "
+            "without --reference-images so the script can route to the text-to-image fallback."
+        )
+    if len(effective_reference_images) > 3:
+        print("Warning: Qwen Image Edit 2509 works best with 1-3 input images; using the first 3 reference images.")
+    uploaded_images = [_comfy_upload_image(path) for path in effective_reference_images[:3]]
+    workflow = _build_comfy_qwen_edit_workflow(prompt_text, uploaded_images, qwen_options=qwen_options, negative=negative)
+    filename = _run_comfy_workflow(workflow, output_file)
+    preset = (qwen_options or {}).get("preset") or os.getenv("COMFYUI_QWEN_PRESET", "balanced")
+    return f"Successfully generated image edit to {output_file} via local Qwen Image Edit preset={preset} ({filename})"
+
+def _generate_image_comfy(prompt: str, reference_images: list[str], output_file: str, aspect_ratio: str) -> str:
+    if reference_images:
+        print("Warning: local ComfyUI SD1.5 provider currently ignores reference images.")
+    prompt_text, negative = _comfy_prompt_text(prompt)
+    workflow = _build_comfy_sd15_workflow(prompt_text, negative, aspect_ratio)
+    filename = _run_comfy_workflow(workflow, output_file)
+    return f"Successfully generated image to {output_file} via local ComfyUI ({filename})"
+
 def generate_image(
     prompt_file: str,
     reference_images: list[str],
     output_file: str,
     aspect_ratio: str = "16:9",
+    qwen_options: dict | None = None,
 ) -> str:
     with open(prompt_file, "r", encoding="utf-8") as f:
         prompt = f.read()
     provider = _resolve_provider(
         "IMAGE_GENERATION_PROVIDER", "gemini", bool(os.getenv("GEMINI_API_KEY"))
     )
+    if provider in ("comfy_qwen_edit", "qwen_image_edit", "qwen-edit"):
+        return _generate_image_comfy_qwen_edit(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
+    if provider == "comfy":
+        if reference_images:
+            return _generate_image_comfy_qwen_edit(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
+        return _generate_image_comfy(prompt, reference_images, output_file, aspect_ratio)
+    if provider in ("comfy_sd15", "sd15", "sd-1.5"):
+        return _generate_image_comfy(prompt, reference_images, output_file, aspect_ratio)
     if provider == "minimax":
         return _generate_image_minimax(prompt, reference_images, output_file, aspect_ratio)
     if provider in ("gemini", "google"):
         return _generate_image_gemini(prompt, reference_images, output_file, aspect_ratio)
-    raise ValueError(f"Unknown image provider: {provider!r} (use 'gemini' or 'minimax')")
+    raise ValueError(f"Unknown image provider: {provider!r} (use 'gemini', 'minimax', 'comfy_qwen_edit', or 'comfy_sd15')")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Generate images using Gemini or MiniMax API")
+    parser = argparse.ArgumentParser(description="Generate images using Gemini, MiniMax, or local Qwen/ComfyUI")
     parser.add_argument("--prompt-file", required=True, help="Absolute path to JSON prompt file")
     parser.add_argument("--reference-images", nargs="*", default=[],
                         help="Absolute paths to reference images (space-separated)")
     parser.add_argument("--output-file", required=True, help="Output path for generated image")
     parser.add_argument("--aspect-ratio", required=False, default="16:9",
                         help="Aspect ratio of the generated image")
+    parser.add_argument("--qwen-preset", choices=["fast", "balanced", "quality"], default=None,
+                        help="Qwen Image Edit preset. Defaults to balanced for higher quality.")
+    parser.add_argument("--qwen-steps", type=int, default=None, help="Qwen KSampler steps override")
+    parser.add_argument("--qwen-cfg", type=float, default=None, help="Qwen KSampler CFG override")
+    parser.add_argument("--qwen-denoise", type=float, default=None, help="Qwen KSampler denoise override")
+    parser.add_argument("--qwen-seed", type=int, default=None, help="Qwen seed override; omit or 0 for random")
+    parser.add_argument("--qwen-sampler", default=None, help="Qwen sampler override, e.g. euler")
+    parser.add_argument("--qwen-scheduler", default=None, help="Qwen scheduler override, e.g. simple")
+    parser.add_argument("--qwen-shift", type=float, default=None, help="Qwen ModelSamplingAuraFlow shift override")
+    parser.add_argument("--qwen-megapixels", type=float, default=None,
+                        help="Optional pre-scale megapixels before Qwen conditioning/VAE. Defaults come from the selected preset.")
+    parser.add_argument("--qwen-weight-dtype", default=None,
+                        help="Qwen UNETLoader weight_dtype override. Defaults to 'default'; use fp8_e4m3fn_fast only as an explicit preview/experimental choice.")
+    parser.add_argument("--qwen-lora-name", default=None, help="Qwen Lightning LoRA filename override")
+    parser.add_argument("--qwen-lora-strength", type=float, default=None, help="Qwen LoRA strength override")
+    lora_group = parser.add_mutually_exclusive_group()
+    lora_group.add_argument("--qwen-use-lora", dest="qwen_use_lora", action="store_true", default=None,
+                            help="Force-enable Qwen Lightning LoRA")
+    lora_group.add_argument("--qwen-no-lora", dest="qwen_use_lora", action="store_false",
+                            help="Force-disable Qwen Lightning LoRA")
     args = parser.parse_args()
+
+    qwen_options = {
+        "preset": args.qwen_preset,
+        "steps": args.qwen_steps,
+        "cfg": args.qwen_cfg,
+        "denoise": args.qwen_denoise,
+        "seed": args.qwen_seed,
+        "sampler": args.qwen_sampler,
+        "scheduler": args.qwen_scheduler,
+        "shift": args.qwen_shift,
+        "megapixels": args.qwen_megapixels,
+        "weight_dtype": args.qwen_weight_dtype,
+        "lora_name": args.qwen_lora_name,
+        "lora_strength": args.qwen_lora_strength,
+        "use_lora": args.qwen_use_lora,
+    }
 
     try:
         print(generate_image(args.prompt_file, args.reference_images,
-                             args.output_file, args.aspect_ratio))
+                             args.output_file, args.aspect_ratio,
+                             qwen_options=qwen_options))
     except Exception as e:
         print(f"Error while generating image: {e}")

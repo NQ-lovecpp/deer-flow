@@ -25,6 +25,7 @@ const config = {
     defaultLocale: "en",
   },
   devIndicators: false,
+  allowedDevOrigins: ["117.72.15.209"],
   async rewrites() {
     const rewrites = [];
     const gatewayURL = getInternalServiceURL(

@@ -1,6 +1,9 @@
 import base64
+import contextlib
+import fcntl
 import json
 import os
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -16,9 +19,27 @@ MINIMAX_PROMPT_MAX_CHARS = 1500
 
 QWEN_EDIT_PRESETS = {
     "fast": {"steps": 4, "cfg": 1.0, "denoise": 1.0, "megapixels": 0.5, "weight_dtype": "default", "use_lora": True},
-    "balanced": {"steps": 20, "cfg": 2.5, "denoise": 1.0, "megapixels": 0.5, "weight_dtype": "default", "use_lora": False},
+    "balanced": {"steps": 20, "cfg": 4.0, "denoise": 1.0, "megapixels": 0.5, "weight_dtype": "default", "use_lora": False},
     "quality": {"steps": 40, "cfg": 4.0, "denoise": 1.0, "megapixels": 1.0, "weight_dtype": "default", "use_lora": False},
 }
+
+QWEN_IMAGE_PRESETS = {
+    "fast": {"steps": 4, "cfg": 1.0, "weight_dtype": "default", "use_lora": False},
+    "balanced": {"steps": 30, "cfg": 4.0, "weight_dtype": "default", "use_lora": False},
+    "quality": {"steps": 50, "cfg": 4.0, "weight_dtype": "default", "use_lora": False},
+}
+
+QWEN_IMAGE_DIMENSIONS = {
+    "1:1": (1328, 1328),
+    "16:9": (1664, 928),
+    "9:16": (928, 1664),
+    "4:3": (1472, 1104),
+    "3:4": (1104, 1472),
+    "3:2": (1584, 1056),
+    "2:3": (1056, 1584),
+}
+
+GIB = 1024 ** 3
 
 
 
@@ -53,7 +74,7 @@ def _resolve_provider(override_env: str, existing_provider: str, has_existing_cr
         return "minimax"
     # Prefer local ComfyUI when no remote credentials are configured. The
     # concrete local workflow is selected later from the request shape: reference
-    # images use Qwen Image Edit, while pure text-to-image uses the SD fallback.
+    # images use Qwen Image Edit, while pure text-to-image uses Qwen Image.
     return "comfy"
 
 
@@ -243,6 +264,20 @@ def _comfy_dimensions(aspect_ratio: str) -> tuple[int, int]:
     }
     return mapping.get(aspect_ratio, mapping["1:1"])
 
+
+def _qwen_image_dimensions(aspect_ratio: str) -> tuple[int, int]:
+    return QWEN_IMAGE_DIMENSIONS.get(aspect_ratio, QWEN_IMAGE_DIMENSIONS["1:1"])
+
+
+def _cap_dimensions(width: int, height: int, max_pixels: int | None) -> tuple[int, int]:
+    if not max_pixels or width * height <= max_pixels:
+        return width, height
+    scale = (max_pixels / float(width * height)) ** 0.5
+    capped_width = max(16, round(width * scale / 16) * 16)
+    capped_height = max(16, round(height * scale / 16) * 16)
+    return capped_width, capped_height
+
+
 def _qwen_blank_dimensions(aspect_ratio: str) -> tuple[int, int]:
     base_w, base_h = _comfy_dimensions(aspect_ratio)
     target_pixels = 1024 * 1024
@@ -292,10 +327,12 @@ def _build_comfy_sd15_workflow(prompt: str, negative: str, aspect_ratio: str) ->
 
 def _comfy_upload_image(image_path: str) -> str:
     host = _comfy_host()
+    suffix = Path(image_path).suffix or ".jpg"
+    remote_name = f"deerflow_{uuid.uuid4().hex[:12]}{suffix}"
     with open(image_path, "rb") as f:
         response = requests.post(
             f"{host}/upload/image",
-            files={"image": (Path(image_path).name, f, _guess_mime(image_path))},
+            files={"image": (remote_name, f, _guess_mime(image_path))},
             data={"type": "input", "overwrite": "true"},
             timeout=120,
         )
@@ -327,6 +364,230 @@ def _qwen_option(options: dict | None, key: str, env_name: str, default, cast):
     return default
 
 
+def _qwen_option_multi(options: dict | None, key: str, env_names: tuple[str, ...], default, cast):
+    if options and options.get(key) is not None:
+        return cast(options[key])
+    for env_name in env_names:
+        env_value = os.getenv(env_name)
+        if env_value is not None and env_value != "":
+            return cast(env_value)
+    return default
+
+
+def _option_or_env_set(options: dict | None, key: str, env_names: tuple[str, ...]) -> bool:
+    if options and options.get(key) is not None:
+        return True
+    return any(os.getenv(env_name) not in (None, "") for env_name in env_names)
+
+
+def _qwen_seed(options: dict | None, specific_env: str = "COMFYUI_QWEN_SEED") -> int:
+    seed_value = None
+    if options and options.get("seed") is not None:
+        seed_value = options["seed"]
+    elif os.getenv(specific_env):
+        seed_value = os.getenv(specific_env)
+    elif os.getenv("COMFYUI_SEED"):
+        seed_value = os.getenv("COMFYUI_SEED")
+    return int(seed_value) if seed_value not in (None, "", "0", 0) else int(time.time() * 1000) % 18446744073709551615
+
+
+def _qwen_use_lora(options: dict | None, env_name: str, default: bool) -> bool:
+    requested_use_lora = (options or {}).get("use_lora") if options else None
+    if requested_use_lora is not None:
+        return bool(requested_use_lora)
+    env_use_lora = _parse_bool(os.getenv(env_name))
+    if env_use_lora is not None:
+        return env_use_lora
+    return default
+
+
+def _float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+    return float(value)
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+    return int(value)
+
+
+def _comfy_resource_snapshot() -> dict:
+    host = _comfy_host()
+    stats = requests.get(f"{host}/system_stats", timeout=10).json()
+    queue = requests.get(f"{host}/queue", timeout=10).json()
+    system = stats.get("system") or {}
+    devices = stats.get("devices") or []
+    device = devices[0] if devices else {}
+    return {
+        "ram_total": system.get("ram_total"),
+        "ram_free": system.get("ram_free"),
+        "device_name": device.get("name"),
+        "vram_total": device.get("vram_total"),
+        "vram_free": device.get("vram_free"),
+        "torch_vram_total": device.get("torch_vram_total"),
+        "torch_vram_free": device.get("torch_vram_free"),
+        "queue_running": len(queue.get("queue_running") or []),
+        "queue_pending": len(queue.get("queue_pending") or []),
+    }
+
+
+def _gb(value: int | float | None) -> float | None:
+    if value is None:
+        return None
+    return float(value) / GIB
+
+
+def _format_gb(value: int | float | None) -> str:
+    gb = _gb(value)
+    return "unknown" if gb is None else f"{gb:.1f}GiB"
+
+
+def _memory_budget_mode(options: dict | None) -> str:
+    mode = (options or {}).get("memory_budget") or os.getenv("SPARK_IMAGE_MEMORY_BUDGET", "balanced")
+    mode = str(mode).strip().lower()
+    if mode not in {"off", "relaxed", "balanced", "conservative"}:
+        raise ValueError("SPARK_IMAGE_MEMORY_BUDGET must be off, relaxed, balanced, or conservative")
+    return mode
+
+
+@contextlib.contextmanager
+def _comfy_generation_lock():
+    enabled = _parse_bool(os.getenv("SPARK_IMAGE_LOCK", "1"))
+    if not enabled:
+        yield
+        return
+    lock_path = os.getenv("SPARK_IMAGE_LOCK_FILE", "/tmp/deerflow_comfy_generation.lock")
+    Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _apply_spark_memory_budget(kind: str, opts: dict, options: dict | None, aspect_ratio: str) -> dict:
+    mode = _memory_budget_mode(options)
+    if mode == "off":
+        return opts
+
+    snapshot = _comfy_resource_snapshot()
+    print(
+        "Spark memory snapshot: "
+        f"ram_free={_format_gb(snapshot['ram_free'])}/{_format_gb(snapshot['ram_total'])}, "
+        f"vram_free={_format_gb(snapshot['vram_free'])}/{_format_gb(snapshot['vram_total'])}, "
+        f"torch_free={_format_gb(snapshot['torch_vram_free'])}/{_format_gb(snapshot['torch_vram_total'])}, "
+        f"queue_running={snapshot['queue_running']}, queue_pending={snapshot['queue_pending']}"
+    )
+
+    max_queue = _int_env("SPARK_IMAGE_MAX_QUEUE_ITEMS", 0)
+    queued = snapshot["queue_running"] + snapshot["queue_pending"]
+    if queued > max_queue:
+        raise RuntimeError(f"ComfyUI queue has {queued} item(s), above budget {max_queue}; wait or raise SPARK_IMAGE_MAX_QUEUE_ITEMS")
+
+    ram_free_gb = _gb(snapshot["ram_free"])
+    min_free_gb = _float_env("SPARK_IMAGE_MIN_SYSTEM_FREE_GB", 24.0)
+    low_free_gb = _float_env("SPARK_IMAGE_LOW_SYSTEM_FREE_GB", 48.0)
+    if ram_free_gb is not None and ram_free_gb < min_free_gb:
+        raise MemoryError(f"Spark free RAM is {ram_free_gb:.1f}GiB, below budget minimum {min_free_gb:.1f}GiB")
+
+    should_conserve = mode == "conservative" or (ram_free_gb is not None and ram_free_gb < low_free_gb)
+    if kind == "qwen_image":
+        if mode == "relaxed":
+            default_max_pixels = 0
+        elif should_conserve:
+            default_max_pixels = 1024 * 1024
+        else:
+            default_max_pixels = 0
+        max_pixels = _int_env("SPARK_IMAGE_MAX_PIXELS", default_max_pixels)
+        opts["max_pixels"] = max_pixels if max_pixels > 0 else None
+        if should_conserve and not _option_or_env_set(options, "steps", ("COMFYUI_QWEN_IMAGE_STEPS", "COMFYUI_QWEN_STEPS")):
+            opts["steps"] = min(opts["steps"], 20)
+    elif kind == "qwen_edit":
+        if should_conserve and not _option_or_env_set(options, "megapixels", ("COMFYUI_QWEN_MEGAPIXELS",)):
+            opts["megapixels"] = min(float(opts["megapixels"] or 0.5), 0.35)
+        if should_conserve and not _option_or_env_set(options, "steps", ("COMFYUI_QWEN_STEPS",)):
+            opts["steps"] = min(opts["steps"], 20)
+    return opts
+
+
+def _resolve_qwen_image_options(options: dict | None = None) -> dict:
+    preset = (options or {}).get("preset") or os.getenv("COMFYUI_QWEN_IMAGE_PRESET") or os.getenv("COMFYUI_QWEN_PRESET", "quality")
+    preset = str(preset).strip().lower()
+    if preset not in QWEN_IMAGE_PRESETS:
+        raise ValueError(f"Unknown Qwen preset: {preset!r} (use fast, balanced, or quality)")
+    defaults = QWEN_IMAGE_PRESETS[preset]
+
+    return {
+        "preset": preset,
+        "unet": os.getenv("COMFYUI_QWEN_IMAGE_UNET", "qwen_image_2512_fp8_e4m3fn.safetensors"),
+        "clip": os.getenv("COMFYUI_QWEN_IMAGE_CLIP") or os.getenv("COMFYUI_QWEN_CLIP", "qwen_2.5_vl_7b_fp8_scaled.safetensors"),
+        "vae": os.getenv("COMFYUI_QWEN_IMAGE_VAE") or os.getenv("COMFYUI_QWEN_VAE", "qwen_image_vae.safetensors"),
+        "lora_name": _qwen_option_multi(options, "lora_name", ("COMFYUI_QWEN_IMAGE_LORA", "COMFYUI_QWEN_LORA"), "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors", str),
+        "lora_strength": _qwen_option_multi(options, "lora_strength", ("COMFYUI_QWEN_IMAGE_LORA_STRENGTH", "COMFYUI_QWEN_LORA_STRENGTH"), 1.0, float),
+        "use_lora": _qwen_use_lora(options, "COMFYUI_QWEN_IMAGE_USE_LORA", defaults["use_lora"]),
+        "weight_dtype": _qwen_option_multi(options, "weight_dtype", ("COMFYUI_QWEN_IMAGE_WEIGHT_DTYPE", "COMFYUI_QWEN_WEIGHT_DTYPE"), defaults["weight_dtype"], str),
+        "steps": _qwen_option_multi(options, "steps", ("COMFYUI_QWEN_IMAGE_STEPS", "COMFYUI_QWEN_STEPS"), defaults["steps"], int),
+        "cfg": _qwen_option_multi(options, "cfg", ("COMFYUI_QWEN_IMAGE_CFG", "COMFYUI_QWEN_CFG"), defaults["cfg"], float),
+        "shift": _qwen_option_multi(options, "shift", ("COMFYUI_QWEN_IMAGE_SHIFT", "COMFYUI_QWEN_SHIFT"), 3.1, float),
+        "sampler": _qwen_option_multi(options, "sampler", ("COMFYUI_QWEN_IMAGE_SAMPLER", "COMFYUI_QWEN_SAMPLER"), "euler", str),
+        "scheduler": _qwen_option_multi(options, "scheduler", ("COMFYUI_QWEN_IMAGE_SCHEDULER", "COMFYUI_QWEN_SCHEDULER"), "simple", str),
+        "seed": _qwen_seed(options, "COMFYUI_QWEN_IMAGE_SEED"),
+        "max_pixels": None,
+    }
+
+
+def _build_comfy_qwen_image_workflow(prompt: str, negative: str, aspect_ratio: str, qwen_options: dict | None = None) -> dict:
+    opts = _resolve_qwen_image_options(qwen_options)
+    opts = _apply_spark_memory_budget("qwen_image", opts, qwen_options, aspect_ratio)
+    width, height = _cap_dimensions(*_qwen_image_dimensions(aspect_ratio), opts.get("max_pixels"))
+    prefix = f"deerflow_qwen_image_{uuid.uuid4().hex[:12]}"
+    workflow: dict[str, dict] = {}
+
+    def add(class_type: str, inputs: dict) -> str:
+        node_id = str(len(workflow) + 1)
+        workflow[node_id] = {"class_type": class_type, "inputs": inputs}
+        return node_id
+
+    unet_id = add("UNETLoader", {"unet_name": opts["unet"], "weight_dtype": opts["weight_dtype"]})
+    model_ref = [unet_id, 0]
+    if opts["use_lora"]:
+        lora_id = add(
+            "LoraLoaderModelOnly",
+            {"model": model_ref, "lora_name": opts["lora_name"], "strength_model": opts["lora_strength"]},
+        )
+        model_ref = [lora_id, 0]
+
+    sampling_id = add("ModelSamplingAuraFlow", {"model": model_ref, "shift": opts["shift"]})
+    clip_id = add("CLIPLoader", {"clip_name": opts["clip"], "type": "qwen_image", "device": "default"})
+    vae_id = add("VAELoader", {"vae_name": opts["vae"]})
+    positive_id = add("CLIPTextEncode", {"clip": [clip_id, 0], "text": prompt})
+    negative_id = add("CLIPTextEncode", {"clip": [clip_id, 0], "text": negative or ""})
+    latent_id = add("EmptySD3LatentImage", {"width": width, "height": height, "batch_size": 1})
+    sample_id = add(
+        "KSampler",
+        {
+            "model": [sampling_id, 0],
+            "seed": opts["seed"],
+            "steps": opts["steps"],
+            "cfg": opts["cfg"],
+            "sampler_name": opts["sampler"],
+            "scheduler": opts["scheduler"],
+            "positive": [positive_id, 0],
+            "negative": [negative_id, 0],
+            "latent_image": [latent_id, 0],
+            "denoise": 1.0,
+        },
+    )
+    decoded_id = add("VAEDecode", {"samples": [sample_id, 0], "vae": [vae_id, 0]})
+    add("SaveImage", {"images": [decoded_id, 0], "filename_prefix": prefix})
+    return workflow
+
+
 def _resolve_qwen_edit_options(options: dict | None = None) -> dict:
     preset = (options or {}).get("preset") or os.getenv("COMFYUI_QWEN_PRESET", "balanced")
     preset = str(preset).strip().lower()
@@ -334,23 +595,7 @@ def _resolve_qwen_edit_options(options: dict | None = None) -> dict:
         raise ValueError(f"Unknown Qwen preset: {preset!r} (use fast, balanced, or quality)")
     defaults = QWEN_EDIT_PRESETS[preset]
 
-    env_use_lora = _parse_bool(os.getenv("COMFYUI_QWEN_USE_LORA"))
-    requested_use_lora = (options or {}).get("use_lora") if options else None
-    if requested_use_lora is not None:
-        use_lora = bool(requested_use_lora)
-    elif env_use_lora is not None:
-        use_lora = env_use_lora
-    else:
-        use_lora = defaults["use_lora"]
-
-    seed_value = None
-    if options and options.get("seed") is not None:
-        seed_value = options["seed"]
-    elif os.getenv("COMFYUI_QWEN_SEED"):
-        seed_value = os.getenv("COMFYUI_QWEN_SEED")
-    elif os.getenv("COMFYUI_SEED"):
-        seed_value = os.getenv("COMFYUI_SEED")
-    seed = int(seed_value) if seed_value not in (None, "", "0", 0) else int(time.time() * 1000) % 18446744073709551615
+    use_lora = _qwen_use_lora(options, "COMFYUI_QWEN_USE_LORA", defaults["use_lora"])
 
     if options and options.get("megapixels") is not None:
         megapixels = float(options["megapixels"])
@@ -363,10 +608,10 @@ def _resolve_qwen_edit_options(options: dict | None = None) -> dict:
 
     return {
         "preset": preset,
-        "unet": os.getenv("COMFYUI_QWEN_UNET", "qwen_image_edit_2509_fp8_e4m3fn.safetensors"),
+        "unet": os.getenv("COMFYUI_QWEN_UNET", "qwen_image_edit_2511_fp8mixed.safetensors"),
         "clip": os.getenv("COMFYUI_QWEN_CLIP", "qwen_2.5_vl_7b_fp8_scaled.safetensors"),
         "vae": os.getenv("COMFYUI_QWEN_VAE", "qwen_image_vae.safetensors"),
-        "lora_name": _qwen_option(options, "lora_name", "COMFYUI_QWEN_LORA", "Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors", str),
+        "lora_name": _qwen_option(options, "lora_name", "COMFYUI_QWEN_LORA", "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", str),
         "lora_strength": _qwen_option(options, "lora_strength", "COMFYUI_QWEN_LORA_STRENGTH", 1.0, float),
         "use_lora": use_lora,
         "weight_dtype": _qwen_option(options, "weight_dtype", "COMFYUI_QWEN_WEIGHT_DTYPE", defaults["weight_dtype"], str),
@@ -377,7 +622,7 @@ def _resolve_qwen_edit_options(options: dict | None = None) -> dict:
         "megapixels": megapixels,
         "sampler": _qwen_option(options, "sampler", "COMFYUI_QWEN_SAMPLER", "euler", str),
         "scheduler": _qwen_option(options, "scheduler", "COMFYUI_QWEN_SCHEDULER", "simple", str),
-        "seed": seed,
+        "seed": _qwen_seed(options),
     }
 
 
@@ -386,6 +631,7 @@ def _build_comfy_qwen_edit_workflow(prompt: str, uploaded_images: list[str], qwe
         raise ValueError("Qwen Image Edit requires at least one uploaded reference image.")
 
     opts = _resolve_qwen_edit_options(qwen_options)
+    opts = _apply_spark_memory_budget("qwen_edit", opts, qwen_options, "reference")
     prefix = f"deerflow_qwen_edit_{uuid.uuid4().hex[:12]}"
     workflow: dict[str, dict] = {}
 
@@ -430,7 +676,10 @@ def _build_comfy_qwen_edit_workflow(prompt: str, uploaded_images: list[str], qwe
         negative_inputs[f"image{index}"] = image_ref
     positive_id = add("TextEncodeQwenImageEditPlus", positive_inputs)
     negative_id = add("TextEncodeQwenImageEditPlus", negative_inputs)
-    latent_id = add("VAEEncode", {"pixels": image_refs[0], "vae": [vae_id, 0]})
+    positive_id = add("FluxKontextMultiReferenceLatentMethod", {"conditioning": [positive_id, 0], "reference_latents_method": "index_timestep_zero"})
+    negative_id = add("FluxKontextMultiReferenceLatentMethod", {"conditioning": [negative_id, 0], "reference_latents_method": "index_timestep_zero"})
+    scaled_source_id = add("FluxKontextImageScale", {"image": image_refs[0]})
+    latent_id = add("VAEEncode", {"pixels": [scaled_source_id, 0], "vae": [vae_id, 0]})
     sample_id = add(
         "KSampler",
         {
@@ -498,20 +747,31 @@ def _generate_image_comfy_qwen_edit(prompt: str, reference_images: list[str], ou
             "without --reference-images so the script can route to the text-to-image fallback."
         )
     if len(effective_reference_images) > 3:
-        print("Warning: Qwen Image Edit 2509 works best with 1-3 input images; using the first 3 reference images.")
+        print("Warning: Qwen Image Edit works best with 1-3 input images; using the first 3 reference images.")
     uploaded_images = [_comfy_upload_image(path) for path in effective_reference_images[:3]]
     workflow = _build_comfy_qwen_edit_workflow(prompt_text, uploaded_images, qwen_options=qwen_options, negative=negative)
     filename = _run_comfy_workflow(workflow, output_file)
     preset = (qwen_options or {}).get("preset") or os.getenv("COMFYUI_QWEN_PRESET", "balanced")
     return f"Successfully generated image edit to {output_file} via local Qwen Image Edit preset={preset} ({filename})"
 
-def _generate_image_comfy(prompt: str, reference_images: list[str], output_file: str, aspect_ratio: str) -> str:
+
+def _generate_image_comfy_qwen_image(prompt: str, reference_images: list[str], output_file: str, aspect_ratio: str, qwen_options: dict | None = None) -> str:
+    if reference_images:
+        print("Warning: local Qwen Image text-to-image provider ignores reference images.")
+    prompt_text, negative = _comfy_prompt_text(prompt)
+    workflow = _build_comfy_qwen_image_workflow(prompt_text, negative, aspect_ratio, qwen_options=qwen_options)
+    filename = _run_comfy_workflow(workflow, output_file)
+    preset = (qwen_options or {}).get("preset") or os.getenv("COMFYUI_QWEN_IMAGE_PRESET") or os.getenv("COMFYUI_QWEN_PRESET", "quality")
+    return f"Successfully generated image to {output_file} via local Qwen Image 2512 preset={preset} ({filename})"
+
+
+def _generate_image_comfy_sd15(prompt: str, reference_images: list[str], output_file: str, aspect_ratio: str) -> str:
     if reference_images:
         print("Warning: local ComfyUI SD1.5 provider currently ignores reference images.")
     prompt_text, negative = _comfy_prompt_text(prompt)
     workflow = _build_comfy_sd15_workflow(prompt_text, negative, aspect_ratio)
     filename = _run_comfy_workflow(workflow, output_file)
-    return f"Successfully generated image to {output_file} via local ComfyUI ({filename})"
+    return f"Successfully generated image to {output_file} via local ComfyUI SD1.5 ({filename})"
 
 def generate_image(
     prompt_file: str,
@@ -526,32 +786,38 @@ def generate_image(
         "IMAGE_GENERATION_PROVIDER", "gemini", bool(os.getenv("GEMINI_API_KEY"))
     )
     if provider in ("comfy_qwen_edit", "qwen_image_edit", "qwen-edit"):
-        return _generate_image_comfy_qwen_edit(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
-    if provider == "comfy":
-        if reference_images:
+        with _comfy_generation_lock():
             return _generate_image_comfy_qwen_edit(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
-        return _generate_image_comfy(prompt, reference_images, output_file, aspect_ratio)
+    if provider in ("comfy_qwen_image", "qwen_image", "qwen-image"):
+        with _comfy_generation_lock():
+            return _generate_image_comfy_qwen_image(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
+    if provider == "comfy":
+        with _comfy_generation_lock():
+            if reference_images:
+                return _generate_image_comfy_qwen_edit(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
+            return _generate_image_comfy_qwen_image(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
     if provider in ("comfy_sd15", "sd15", "sd-1.5"):
-        return _generate_image_comfy(prompt, reference_images, output_file, aspect_ratio)
+        with _comfy_generation_lock():
+            return _generate_image_comfy_sd15(prompt, reference_images, output_file, aspect_ratio)
     if provider == "minimax":
         return _generate_image_minimax(prompt, reference_images, output_file, aspect_ratio)
     if provider in ("gemini", "google"):
         return _generate_image_gemini(prompt, reference_images, output_file, aspect_ratio)
-    raise ValueError(f"Unknown image provider: {provider!r} (use 'gemini', 'minimax', 'comfy_qwen_edit', or 'comfy_sd15')")
+    raise ValueError(f"Unknown image provider: {provider!r} (use 'gemini', 'minimax', 'comfy', 'comfy_qwen_image', 'comfy_qwen_edit', or 'comfy_sd15')")
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Generate images using Gemini, MiniMax, or local Qwen/ComfyUI")
-    parser.add_argument("--prompt-file", required=True, help="Absolute path to JSON prompt file")
+    parser.add_argument("--prompt-file", required=True, help="Absolute path to prompt file")
     parser.add_argument("--reference-images", nargs="*", default=[],
                         help="Absolute paths to reference images (space-separated)")
     parser.add_argument("--output-file", required=True, help="Output path for generated image")
     parser.add_argument("--aspect-ratio", required=False, default="16:9",
                         help="Aspect ratio of the generated image")
     parser.add_argument("--qwen-preset", choices=["fast", "balanced", "quality"], default=None,
-                        help="Qwen Image Edit preset. Defaults to balanced for higher quality.")
+                        help="Qwen preset. Qwen Image defaults to quality; Qwen Image Edit defaults to balanced.")
     parser.add_argument("--qwen-steps", type=int, default=None, help="Qwen KSampler steps override")
     parser.add_argument("--qwen-cfg", type=float, default=None, help="Qwen KSampler CFG override")
     parser.add_argument("--qwen-denoise", type=float, default=None, help="Qwen KSampler denoise override")
@@ -565,6 +831,8 @@ if __name__ == "__main__":
                         help="Qwen UNETLoader weight_dtype override. Defaults to 'default'; use fp8_e4m3fn_fast only as an explicit preview/experimental choice.")
     parser.add_argument("--qwen-lora-name", default=None, help="Qwen Lightning LoRA filename override")
     parser.add_argument("--qwen-lora-strength", type=float, default=None, help="Qwen LoRA strength override")
+    parser.add_argument("--memory-budget", choices=["off", "relaxed", "balanced", "conservative"], default=None,
+                        help="Spark/ComfyUI memory guard. Defaults to SPARK_IMAGE_MEMORY_BUDGET or balanced.")
     lora_group = parser.add_mutually_exclusive_group()
     lora_group.add_argument("--qwen-use-lora", dest="qwen_use_lora", action="store_true", default=None,
                             help="Force-enable Qwen Lightning LoRA")
@@ -586,6 +854,7 @@ if __name__ == "__main__":
         "lora_name": args.qwen_lora_name,
         "lora_strength": args.qwen_lora_strength,
         "use_lora": args.qwen_use_lora,
+        "memory_budget": args.memory_budget,
     }
 
     try:
@@ -594,3 +863,4 @@ if __name__ == "__main__":
                              qwen_options=qwen_options))
     except Exception as e:
         print(f"Error while generating image: {e}")
+        sys.exit(1)

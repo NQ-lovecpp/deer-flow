@@ -13,7 +13,8 @@ This skill generates images using a prompt file and a Python script. Prefer plai
 
 - Create concise plain-text prompts for AIGC image generation
 - Support multiple reference images for style/composition guidance
-- Edit an uploaded/reference image when `IMAGE_GENERATION_PROVIDER=comfy_qwen_edit` is configured
+- Generate pure text-to-image locally with Qwen Image 2512 when `IMAGE_GENERATION_PROVIDER=comfy` and no reference images are supplied
+- Edit an uploaded/reference image locally with Qwen Image Edit 2511 when reference images are supplied
 - Generate images through automated Python script execution
 - Route local text-to-image and image-editing differently so Qwen Edit is not misused as a blank-canvas generator
 - Handle various image generation scenarios (character design, scenes, products, image editing, product retouching, etc.)
@@ -59,11 +60,46 @@ Parameters:
 Do NOT read the python file, just call it with the parameters. For local ComfyUI/Qwen, CLI flags are the source of truth for quality and sampling behavior; JSON fields like `technical.quality` are not real controls.
 
 
-## Local ComfyUI / Qwen Image Edit Provider
+## Local ComfyUI / Qwen Provider
 
-Use `IMAGE_GENERATION_PROVIDER=comfy` for the normal local route. The script automatically selects the right local workflow: with `--reference-images` it uses Qwen Image Edit; without reference images it uses the text-to-image fallback. Do not use Qwen Image Edit for pure text-to-image by inventing a blank canvas; that produces noisy, unusable results. Use `IMAGE_GENERATION_PROVIDER=comfy_qwen_edit` only when you have 1-3 real reference/input images to edit or guide.
+Use `IMAGE_GENERATION_PROVIDER=comfy` for the normal local route. The script automatically selects the right local workflow: with `--reference-images` it uses Qwen Image Edit 2511; without reference images it uses Qwen Image 2512 text-to-image. Do not use Qwen Image Edit for pure text-to-image by inventing a blank canvas; that produces noisy, unusable results. Use `IMAGE_GENERATION_PROVIDER=comfy_qwen_edit` only when you have 1-3 real reference/input images to edit or guide.
 
-Use plain-text prompt files and explicit `--qwen-*` CLI parameters for Qwen image editing; do not encode Qwen quality controls in JSON.
+Use plain-text prompt files and explicit `--qwen-*` CLI parameters for Qwen generation/editing; do not encode Qwen quality controls in JSON.
+
+### Spark Scheduling And Memory Budget
+
+Before local ComfyUI generation, inspect Spark resource state:
+
+```bash
+COMFYUI_URL=http://127.0.0.1:8188 python /mnt/skills/public/image-generation/scripts/comfy_resource_status.py
+```
+
+Scheduling rules:
+
+- Do not start a new job when ComfyUI has a running or pending queue item unless the user explicitly asks for parallel generation.
+- Prefer `IMAGE_GENERATION_PROVIDER=comfy`; it selects Qwen Image 2512 for no-reference generation and Qwen Image Edit 2511 for reference-image editing.
+- Keep `--memory-budget balanced` unless the user asks otherwise. Use `conservative` for long batch work or when free RAM is below 48GiB; use `relaxed` only for a single high-quality foreground task; use `off` only for debugging.
+- The script also enforces the budget before posting to ComfyUI. It takes a local file lock, reads `/system_stats` and `/queue`, prints a memory snapshot, blocks when the queue is above budget, and scales work down when Spark free RAM is low.
+
+Budget environment overrides:
+
+- `SPARK_IMAGE_MEMORY_BUDGET=off|relaxed|balanced|conservative`
+- `SPARK_IMAGE_MIN_SYSTEM_FREE_GB` default `24`
+- `SPARK_IMAGE_LOW_SYSTEM_FREE_GB` default `48`
+- `SPARK_IMAGE_MAX_QUEUE_ITEMS` default `0`
+- `SPARK_IMAGE_MAX_PIXELS` caps Qwen Image 2512 text-to-image pixels; default `0` at balanced/relaxed budgets and `1048576` when conserving
+- `SPARK_IMAGE_LOCK=0` disables the per-machine ComfyUI generation lock for deliberate parallel testing
+
+### Quantization Choice
+
+Prefer official ComfyUI FP8-family weights on Spark:
+
+- Qwen Image 2512: `qwen_image_2512_fp8_e4m3fn.safetensors`
+- Qwen Image Edit 2511: `qwen_image_edit_2511_fp8mixed.safetensors`
+- Qwen Image Layered: `qwen_image_layered_fp8mixed.safetensors`
+- Shared text encoder: `qwen_2.5_vl_7b_fp8_scaled.safetensors`
+
+Use bf16 only when quality comparison or model-debugging justifies the memory cost. Treat int8/GGUF as a separate low-memory compatibility route, not the default, because these bundled ComfyUI workflows and API builders use native diffusion/UNET loaders that align with the official FP8-family files.
 
 Use it for requests such as:
 
@@ -72,16 +108,20 @@ Use it for requests such as:
 - Combine or reference multiple uploaded images, such as person + product, person + scene, or up to three visual references
 - Product retouching, poster edits, meme/text edits, portrait style transfer, and other user-owned image edits
 
-Do not claim image input is unavailable. Uploaded files under `/mnt/user-data/uploads/` should be passed as `--reference-images`. If there is no uploaded/reference image, do not force Qwen Image Edit; call the script with `IMAGE_GENERATION_PROVIDER=comfy` and no `--reference-images` so it routes to the text-to-image fallback.
+Do not claim image input is unavailable. Uploaded files under `/mnt/user-data/uploads/` should be passed as `--reference-images`. If there is no uploaded/reference image, do not force Qwen Image Edit; call the script with `IMAGE_GENERATION_PROVIDER=comfy` and no `--reference-images` so it routes to Qwen Image 2512.
 
-Example pure text-to-image command with the local fallback:
+Example pure text-to-image command with Qwen Image 2512:
 
 ```bash
 cat > /mnt/user-data/workspace/logo-prompt.txt <<EOF
 A clean vector-style logo of 1I/ʻOumuamua, elongated interstellar object silhouette, elegant orbital arc, high contrast, minimal shapes, professional astronomy brand mark, no text.
 EOF
 
-IMAGE_GENERATION_PROVIDER=comfy python /mnt/skills/public/image-generation/scripts/generate.py   --prompt-file /mnt/user-data/workspace/logo-prompt.txt   --output-file /mnt/user-data/outputs/oumuamua-logo.jpg   --aspect-ratio 1:1
+IMAGE_GENERATION_PROVIDER=comfy python /mnt/skills/public/image-generation/scripts/generate.py \
+  --prompt-file /mnt/user-data/workspace/logo-prompt.txt \
+  --output-file /mnt/user-data/outputs/oumuamua-logo.jpg \
+  --aspect-ratio 1:1 \
+  --qwen-preset quality
 ```
 
 Example balanced-quality image editing command:
@@ -111,9 +151,10 @@ IMAGE_GENERATION_PROVIDER=comfy_qwen_edit python /mnt/skills/public/image-genera
 
 Qwen preset guidance:
 
-- `--qwen-preset balanced` is the default and recommended first try. It disables Lightning LoRA and uses about 20 steps / CFG 2.5 / denoise 1.0 / 0.5MP / `weight_dtype=default`.
-- `--qwen-preset quality` is slower and uses about 40 steps / CFG 4.0 / denoise 1.0 / 1.0MP / `weight_dtype=default`.
-- `--qwen-preset fast --qwen-use-lora` is for quick previews only. It uses the local 4-step Lightning LoRA and may look rough.
+- For Qwen Image 2512 text-to-image, `--qwen-preset quality` is the default and uses about 50 steps / CFG 4.0 at the official 2512 aspect-ratio dimensions.
+- For Qwen Image Edit 2511, `--qwen-preset balanced` is the default and recommended first try. It disables Lightning LoRA and uses about 20 steps / CFG 4.0 / denoise 1.0 / 0.5MP / `weight_dtype=default`.
+- `--qwen-preset fast` is for quick smoke previews only. It keeps Lightning LoRA off by default on Spark, because the 2512 Lightning LoRA can be less stable than the native FP8 path.
+- Use `--qwen-use-lora` only for explicit Lightning LoRA experiments after checking the queue and memory budget.
 
 Useful Qwen controls:
 
@@ -130,15 +171,27 @@ Useful Qwen controls:
 
 Important notes for this local provider:
 
-- `IMAGE_GENERATION_PROVIDER=comfy` is the default local route. With reference images it uses Qwen Image Edit; without reference images it uses the text-to-image fallback.
+- `IMAGE_GENERATION_PROVIDER=comfy` is the default local route. With reference images it uses Qwen Image Edit 2511; without reference images it uses Qwen Image 2512.
+- `IMAGE_GENERATION_PROVIDER=comfy_qwen_image` forces Qwen Image 2512 text-to-image. It ignores reference images.
 - Qwen Image Edit requires real reference/input images. Do not use blank, generated, or dummy images just to satisfy the API.
-- Qwen Image Edit 2509 works best with 1-3 input images. If more are supplied, use the most relevant first three.
+- Qwen Image Edit works best with 1-3 input images. If more are supplied, use the most relevant first three.
 - The first reference image is the main image to edit and is encoded into the edit latent. The second and third images are additional visual references.
 - The local workflow passes the same images and VAE to both positive and negative Qwen conditioning. This avoids the broken colorful-noise behavior seen with incomplete conditioning.
 - Do not default to `fp8_e4m3fn_fast`; on this machine it has produced colorful mosaic outputs. Use the default weight dtype unless explicitly experimenting.
 - Removing labels, stickers, or large occluding objects is high risk because Qwen Image Edit may redraw brand text and object structure. For strict local preservation, use or request a mask/inpaint workflow instead.
 - Qwen Image Edit needs enough free unified GPU memory. If generation appears stuck, check ComfyUI queue/logs and available VRAM.
 - Do not use this skill to remove watermarks or copyright marks from third-party images. For ordinary user-owned edits, proceed normally.
+
+## Bundled ComfyUI Workflows
+
+Use the bundled workflow files when inspecting or authoring in ComfyUI itself:
+
+- `workflows/comfy/ui/qwen-image-2512.json`: official ComfyUI UI/subgraph workflow for Qwen Image 2512 text-to-image.
+- `workflows/comfy/ui/qwen-image-edit-2511.json`: official ComfyUI UI/subgraph workflow for Qwen Image Edit 2511.
+- `workflows/comfy/ui/qwen-image-layered.json`: official ComfyUI UI/subgraph workflow for Qwen Image Layered.
+- `workflows/comfy/model-manifest.json`: ModelScope download URLs and target ComfyUI model paths.
+
+These UI workflow JSON files are for ComfyUI authoring and visual inspection. Do not post them directly to `/prompt`; use `scripts/generate.py`, which builds API workflows dynamically.
 
 ## Character Generation Example
 
@@ -281,10 +334,10 @@ IMAGE_GENERATION_PROVIDER=comfy_qwen_edit python /mnt/skills/public/image-genera
   --qwen-denoise 0.9
 ```
 
-For no-image local generation, still use Qwen and simply omit `--reference-images`:
+For no-image local generation, use `IMAGE_GENERATION_PROVIDER=comfy` or force `comfy_qwen_image`, and omit `--reference-images`:
 
 ```bash
-IMAGE_GENERATION_PROVIDER=comfy_qwen_edit python /mnt/skills/public/image-generation/scripts/generate.py \
+IMAGE_GENERATION_PROVIDER=comfy python /mnt/skills/public/image-generation/scripts/generate.py \
   --prompt-file /mnt/user-data/workspace/logo.txt \
   --output-file /mnt/user-data/outputs/logo.png \
   --aspect-ratio 1:1 \
@@ -299,12 +352,13 @@ Avoid relying on JSON fields such as `technical.quality`, `steps`, `cfg`, or `de
 
 This skill auto-selects the provider by environment variables (no CLI change):
 
-- `IMAGE_GENERATION_PROVIDER=comfy_qwen_edit` → use local ComfyUI Qwen Image Edit, with optional reference images.
-- `IMAGE_GENERATION_PROVIDER=comfy` → compatibility alias for local Qwen Image Edit, not SD1.5.
+- `IMAGE_GENERATION_PROVIDER=comfy` → local ComfyUI auto-route: Qwen Image 2512 without references, Qwen Image Edit 2511 with references.
+- `IMAGE_GENERATION_PROVIDER=comfy_qwen_image` → force local Qwen Image 2512 text-to-image.
+- `IMAGE_GENERATION_PROVIDER=comfy_qwen_edit` → force local Qwen Image Edit 2511 and require real reference images.
 - `IMAGE_GENERATION_PROVIDER=comfy_sd15` → explicit old SD1.5 fallback only when the user asks for it.
 - `GEMINI_API_KEY` set → use Gemini when no explicit provider is set.
 - Only `MINIMAX_API_KEY` set → use MiniMax (`/v1/image_generation`, model `image-01`).
-- Force one explicitly with `IMAGE_GENERATION_PROVIDER=gemini|minimax|comfy_qwen_edit|comfy_sd15`. Prefer `comfy_qwen_edit` for local work.
+- Force one explicitly with `IMAGE_GENERATION_PROVIDER=gemini|minimax|comfy|comfy_qwen_image|comfy_qwen_edit|comfy_sd15`. Prefer `comfy` for local work.
 
 MiniMax optional overrides: `MINIMAX_API_HOST` (default `https://api.minimaxi.com`),
 `MINIMAX_IMAGE_MODEL` (default `image-01`). Reference images are sent as the MiniMax

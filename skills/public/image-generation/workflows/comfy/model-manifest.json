@@ -1,0 +1,67 @@
+{
+  "comfyui_dir_default": "/home/chen/comfyui/ComfyUI",
+  "source": "ModelScope public mirrors for ComfyUI Qwen image workflows",
+  "models": [
+    {
+      "id": "qwen-image-2512-diffusion",
+      "filename": "qwen_image_2512_fp8_e4m3fn.safetensors",
+      "target": "models/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors",
+      "modelscope_url": "https://www.modelscope.cn/models/Comfy-Org/Qwen-Image_ComfyUI/resolve/master/split_files/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors",
+      "required_for": ["qwen-image-2512"]
+    },
+    {
+      "id": "qwen-image-shared-text-encoder",
+      "filename": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "target": "models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "modelscope_url": "https://www.modelscope.cn/models/Comfy-Org/Qwen-Image_ComfyUI/resolve/master/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "required_for": ["qwen-image-2512", "qwen-image-edit-2511", "qwen-image-layered"]
+    },
+    {
+      "id": "qwen-image-shared-vae",
+      "filename": "qwen_image_vae.safetensors",
+      "target": "models/vae/qwen_image_vae.safetensors",
+      "modelscope_url": "https://www.modelscope.cn/models/Comfy-Org/Qwen-Image_ComfyUI/resolve/master/split_files/vae/qwen_image_vae.safetensors",
+      "required_for": ["qwen-image-2512", "qwen-image-edit-2511"]
+    },
+    {
+      "id": "qwen-image-2512-lightning-lora",
+      "filename": "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors",
+      "target": "models/loras/Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors",
+      "modelscope_url": "https://www.modelscope.cn/models/lightx2v/Qwen-Image-2512-Lightning/resolve/master/Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors",
+      "required_for": ["qwen-image-2512-fast"]
+    },
+    {
+      "id": "qwen-image-edit-2511-diffusion",
+      "filename": "qwen_image_edit_2511_fp8mixed.safetensors",
+      "target": "models/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors",
+      "modelscope_url": "https://www.modelscope.cn/models/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/master/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors",
+      "required_for": ["qwen-image-edit-2511"]
+    },
+    {
+      "id": "qwen-image-edit-2511-lightning-lora",
+      "filename": "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+      "target": "models/loras/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+      "modelscope_url": "https://www.modelscope.cn/models/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/master/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+      "required_for": ["qwen-image-edit-2511-fast"]
+    },
+    {
+      "id": "qwen-image-layered-diffusion",
+      "filename": "qwen_image_layered_fp8mixed.safetensors",
+      "target": "models/diffusion_models/qwen_image_layered_fp8mixed.safetensors",
+      "modelscope_url": "https://www.modelscope.cn/models/Comfy-Org/Qwen-Image-Layered_ComfyUI/resolve/master/split_files/diffusion_models/qwen_image_layered_fp8mixed.safetensors",
+      "required_for": ["qwen-image-layered"]
+    },
+    {
+      "id": "qwen-image-layered-vae",
+      "filename": "qwen_image_layered_vae.safetensors",
+      "target": "models/vae/qwen_image_layered_vae.safetensors",
+      "modelscope_url": "https://www.modelscope.cn/models/Comfy-Org/Qwen-Image-Layered_ComfyUI/resolve/master/split_files/vae/qwen_image_layered_vae.safetensors",
+      "required_for": ["qwen-image-layered"]
+    }
+  ],
+  "ui_workflows": [
+    "workflows/comfy/ui/qwen-image-2512.json",
+    "workflows/comfy/ui/qwen-image-edit-2511.json",
+    "workflows/comfy/ui/qwen-image-layered.json"
+  ]
+}

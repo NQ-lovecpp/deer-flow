@@ -1,5 +1,7 @@
 "use client";
 
+import type { Message } from "@langchain/langgraph-sdk";
+import { useQueryClient } from "@tanstack/react-query";
 import type { ChatStatus } from "ai";
 import {
   CheckIcon,
@@ -22,7 +24,6 @@ import {
   useState,
   type ComponentProps,
   type KeyboardEvent,
-  type RefObject,
 } from "react";
 import { toast } from "sonner";
 
@@ -37,6 +38,7 @@ import {
   PromptInputBody,
   PromptInputButton,
   PromptInputFooter,
+  PromptInputHeader,
   PromptInputSubmit,
   PromptInputTextarea,
   PromptInputTools,
@@ -64,9 +66,15 @@ import { getBackendBaseURL } from "@/core/config";
 import { useI18n } from "@/core/i18n/hooks";
 import { isHiddenFromUIMessage } from "@/core/messages/utils";
 import { useModels } from "@/core/models/hooks";
+import {
+  buildReferenceMessageMetadata,
+  type SidecarContext,
+} from "@/core/sidecar";
 import { useSkills } from "@/core/skills/hooks";
 import { useSuggestionsConfig } from "@/core/suggestions/hooks";
 import type { AgentThreadContext, GoalState } from "@/core/threads";
+import { compactThreadContext } from "@/core/threads/api";
+import { threadTokenUsageQueryKey } from "@/core/threads/token-usage";
 import { textOfMessage } from "@/core/threads/utils";
 import {
   formatUploadSize,
@@ -112,6 +120,7 @@ import {
 } from "./input-box-helpers";
 import { useThread } from "./messages/context";
 import { ModeHoverGuide } from "./mode-hover-guide";
+import { ReferenceAttachmentSummary, useMaybeSidecar } from "./sidecar";
 import { Tooltip } from "./tooltip";
 
 type InputMode = "flash" | "thinking" | "pro" | "ultra";
@@ -127,6 +136,68 @@ function getResolvedMode(
     return mode;
   }
   return supportsThinking ? "pro" : "flash";
+}
+
+function escapeXmlAttribute(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+export type InputBoxSubmitOptions = {
+  additionalKwargs?: Record<string, unknown>;
+  additionalInputMessages?: Message[];
+  onSent?: () => void;
+};
+
+function buildHiddenConversationQuoteMessage({
+  contexts,
+}: {
+  contexts: SidecarContext[];
+}): Message {
+  return {
+    type: "human",
+    content: [
+      {
+        type: "text",
+        text: [
+          contexts.length === 1
+            ? "The user added the following quoted context to this conversation."
+            : `The user added the following ${contexts.length} quoted contexts to this conversation.`,
+          "Use the referenced_message blocks as reference material for the user's next message.",
+          "",
+          ...contexts.flatMap((context, index) =>
+            [
+              `<referenced_message index="${index + 1}" label="${escapeXmlAttribute(
+                context.label,
+              )}">`,
+              `Role: ${context.role === "user" ? "User" : "Assistant"}`,
+              context.messageId ? `Message ID: ${context.messageId}` : null,
+              "",
+              context.content,
+              "</referenced_message>",
+              "",
+            ].filter((line): line is string => line !== null),
+          ),
+        ]
+          .filter((line): line is string => line !== null)
+          .join("\n"),
+      },
+    ],
+    additional_kwargs: {
+      hide_from_ui: true,
+      conversation_quote_context: true,
+      // Keep ids/roles/count 1:1 parallel with `contexts` so consumers can zip
+      // them safely; do not dedupe ids here.
+      referenced_message_ids: contexts.map(
+        (context) => context.messageId ?? "",
+      ),
+      referenced_message_roles: contexts.map((context) => context.role),
+      quote_context_count: contexts.length,
+    },
+  } as Message;
 }
 
 export function InputBox({
@@ -176,15 +247,20 @@ export function InputBox({
   ) => void;
   onFollowupsVisibilityChange?: (visible: boolean) => void;
   onGoalChange?: (goal: GoalState | null) => void;
-  onSubmit?: (message: PromptInputMessage) => void | Promise<void>;
+  onSubmit?: (
+    message: PromptInputMessage,
+    options?: InputBoxSubmitOptions,
+  ) => void | Promise<void>;
   onStop?: () => void;
 }) {
   const { t } = useI18n();
+  const queryClient = useQueryClient();
   const searchParams = useSearchParams();
   const [modelDialogOpen, setModelDialogOpen] = useState(false);
   const { models } = useModels();
   const { thread, isMock } = useThread();
   const { attachments, textInput } = usePromptInputController();
+  const sidecar = useMaybeSidecar();
   const attachmentParts = attachments.files;
   const removeAttachment = attachments.remove;
   const { skills } = useSkills();
@@ -192,6 +268,7 @@ export function InputBox({
   const promptRootRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const goalRequestStateRef = useRef(createGoalRequestState());
+  const compactRequestStateRef = useRef(createGoalRequestState());
   const promptHistoryIndexRef = useRef<number | null>(null);
   const promptHistoryDraftRef = useRef("");
 
@@ -220,8 +297,13 @@ export function InputBox({
         description: t.inputBox.goalCommandDescription,
         kind: "builtin",
       },
+      {
+        name: "compact",
+        description: t.inputBox.compactCommandDescription,
+        kind: "builtin",
+      },
     ],
-    [t.inputBox.goalCommandDescription],
+    [t.inputBox.compactCommandDescription, t.inputBox.goalCommandDescription],
   );
 
   const reportUploadLimitViolations = useCallback(
@@ -356,7 +438,11 @@ export function InputBox({
 
   useEffect(() => {
     const goalRequestState = goalRequestStateRef.current;
-    return () => abortGoalRequest(goalRequestState);
+    const compactRequestState = compactRequestStateRef.current;
+    return () => {
+      abortGoalRequest(goalRequestState);
+      abortGoalRequest(compactRequestState);
+    };
   }, [threadId]);
 
   useEffect(() => {
@@ -529,6 +615,66 @@ export function InputBox({
     ],
   );
 
+  const handleCompactCommand = useCallback(async (): Promise<void> => {
+    if (isWelcomeMode) {
+      textInput.setInput("");
+      toast.info(t.inputBox.compactSkipped);
+      return;
+    }
+    const request = beginGoalRequest(compactRequestStateRef.current, threadId);
+    const signal = request.controller.signal;
+    try {
+      const result = await compactThreadContext(threadId, {
+        signal,
+        agentName:
+          typeof context.agent_name === "string" ? context.agent_name : null,
+      });
+      if (
+        !isCurrentGoalRequest(compactRequestStateRef.current, request, threadId)
+      ) {
+        return;
+      }
+      textInput.setInput("");
+      promptHistoryIndexRef.current = null;
+      promptHistoryDraftRef.current = "";
+      setFollowups([]);
+      setFollowupsHidden(false);
+      setFollowupsLoading(false);
+
+      void queryClient.invalidateQueries({ queryKey: ["thread", threadId] });
+      void queryClient.invalidateQueries({
+        queryKey: threadTokenUsageQueryKey(threadId),
+      });
+
+      if (result.compacted) {
+        toast.success(t.inputBox.compactSuccess);
+      } else {
+        toast.info(t.inputBox.compactSkipped);
+      }
+    } catch (error) {
+      if (
+        isAbortError(error) ||
+        !isCurrentGoalRequest(compactRequestStateRef.current, request, threadId)
+      ) {
+        return;
+      }
+      toast.error(
+        error instanceof Error ? error.message : t.inputBox.compactFailed,
+      );
+    } finally {
+      finishGoalRequest(compactRequestStateRef.current, request);
+    }
+  }, [
+    context.agent_name,
+    queryClient,
+    t.inputBox.compactFailed,
+    t.inputBox.compactSkipped,
+    t.inputBox.compactSuccess,
+    isWelcomeMode,
+    textInput,
+    threadId,
+  ]);
+
   const submitThreadMessage = useCallback(
     (message: PromptInputMessage) => {
       const files = message.files.flatMap((file) =>
@@ -541,7 +687,7 @@ export function InputBox({
       }
       const placeholder = findSuggestionTemplatePlaceholder(message.text);
       if (placeholder) {
-        toast.error(t.inputBox.suggestionPlaceholderRequired);
+        toast.warning(t.inputBox.suggestionPlaceholderRequired);
         requestAnimationFrame(() => {
           const textarea = textareaRef.current;
           if (!textarea) {
@@ -559,6 +705,26 @@ export function InputBox({
       setFollowups([]);
       setFollowupsHidden(false);
       setFollowupsLoading(false);
+      const quotes = sidecar?.conversationQuotes ?? [];
+      const quoteIds = quotes.map((quote) => quote.id);
+      const quoteContexts = quotes.map((quote) => quote.context);
+      const submitOptions: InputBoxSubmitOptions | undefined = quotes.length
+        ? {
+            additionalKwargs: buildReferenceMessageMetadata(quoteContexts),
+            additionalInputMessages: [
+              buildHiddenConversationQuoteMessage({
+                contexts: quoteContexts,
+              }),
+            ],
+            // Clear quotes only once the send genuinely proceeds. If the send
+            // is dropped by the in-flight guard, `onSent` never fires and the
+            // quotes stay attached so they aren't silently lost.
+            onSent: () => {
+              sidecar?.clearConversationQuotes(quoteIds);
+            },
+          }
+        : undefined;
+      const submit = () => onSubmit?.(message, submitOptions);
 
       // Guard against submitting before the initial model auto-selection
       // effect has flushed thread settings to storage/state.
@@ -573,12 +739,12 @@ export function InputBox({
         });
         return new Promise<void>((resolve, reject) => {
           setTimeout(() => {
-            Promise.resolve(onSubmit?.(message)).then(resolve).catch(reject);
+            Promise.resolve(submit()).then(resolve).catch(reject);
           }, 0);
         });
       }
 
-      return onSubmit?.(message);
+      return submit();
     },
     [
       context,
@@ -587,6 +753,7 @@ export function InputBox({
       reportUploadLimitViolations,
       resolvedModelName,
       selectedModel?.supports_thinking,
+      sidecar,
       t.inputBox.suggestionPlaceholderRequired,
       uploadLimits,
     ],
@@ -620,6 +787,9 @@ export function InputBox({
         }
         return;
       }
+      if (submitAction.kind === "compact") {
+        return handleCompactCommand();
+      }
       if (submitAction.kind === "stop") {
         onStop?.();
         return;
@@ -629,7 +799,14 @@ export function InputBox({
       }
       return submitThreadMessage(message);
     },
-    [handleGoalCommand, onStop, status, submitThreadMessage],
+    [
+      handleCompactCommand,
+      handleGoalCommand,
+      onStop,
+      status,
+      submitThreadMessage,
+      t.inputBox.pleaseWaitStreaming,
+    ],
   );
 
   const requestFormSubmit = useCallback(() => {
@@ -969,6 +1146,18 @@ export function InputBox({
     threadId,
   ]);
 
+  const onSelectPlaceholder = useCallback((newText: string) => {
+    const placeholder = findSuggestionTemplatePlaceholder(newText);
+    if (placeholder) {
+      requestAnimationFrame(() => {
+        const textarea = textareaRef.current;
+        if (!textarea) return;
+        textarea.focus();
+        textarea.setSelectionRange(placeholder.start, placeholder.end);
+      });
+    }
+  }, []);
+
   return (
     <div
       ref={promptRootRef}
@@ -1057,7 +1246,7 @@ export function InputBox({
       )}
       <PromptInput
         className={cn(
-          "bg-background/85 rounded-2xl backdrop-blur-sm transition-all duration-300 ease-out *:data-[slot='input-group']:rounded-2xl",
+          "bg-background/85 relative z-10 rounded-2xl backdrop-blur-sm transition-all duration-300 ease-out *:data-[slot='input-group']:rounded-2xl",
           className,
         )}
         disabled={disabled}
@@ -1073,9 +1262,22 @@ export function InputBox({
             </div>
           </div>
         )}
-        <PromptInputAttachments>
-          {(attachment) => <PromptInputAttachment data={attachment} />}
-        </PromptInputAttachments>
+        <PromptInputHeader className="flex-wrap px-3 pt-3 pb-0 empty:hidden">
+          <PromptInputAttachments className="contents p-0">
+            {(attachment) => (
+              <div className="max-w-60">
+                <PromptInputAttachment data={attachment} />
+              </div>
+            )}
+          </PromptInputAttachments>
+          {sidecar && sidecar.conversationQuotes.length > 0 && (
+            <ReferenceAttachmentSummary
+              references={sidecar.conversationQuotes}
+              testId="conversation-quote-attachment"
+              onClear={() => sidecar.clearConversationQuotes()}
+            />
+          )}
+        </PromptInputHeader>
         <PromptInputBody className="absolute top-0 right-0 left-0 z-3">
           <PromptInputTextarea
             className={cn("size-full")}
@@ -1446,16 +1648,16 @@ export function InputBox({
             />
           </PromptInputTools>
         </PromptInputFooter>
-        {!isWelcomeMode && (
-          <div className="bg-background absolute right-0 -bottom-[17px] left-0 z-0 h-4"></div>
-        )}
       </PromptInput>
+      {!isWelcomeMode && (
+        <div className="bg-background absolute right-0 -bottom-[17px] left-0 z-0 h-4"></div>
+      )}
 
       {isWelcomeMode &&
         searchParams.get("mode") !== "skill" &&
         !showSkillSuggestions && (
           <div className="flex items-center justify-center pt-2">
-            <SuggestionList textareaRef={textareaRef} />
+            <SuggestionList onSelectPlaceholder={onSelectPlaceholder} />
           </div>
         )}
 
@@ -1485,9 +1687,9 @@ export function InputBox({
 }
 
 function SuggestionList({
-  textareaRef,
+  onSelectPlaceholder,
 }: {
-  textareaRef: RefObject<HTMLTextAreaElement | null>;
+  onSelectPlaceholder: (newText: string) => void;
 }) {
   const { t } = useI18n();
   const { textInput } = usePromptInputController();
@@ -1495,16 +1697,9 @@ function SuggestionList({
     (prompt: string | undefined) => {
       if (!prompt) return;
       textInput.setInput(prompt);
-      requestAnimationFrame(() => {
-        const textarea = textareaRef.current;
-        const placeholder = findSuggestionTemplatePlaceholder(prompt);
-        if (textarea && placeholder) {
-          textarea.focus();
-          textarea.setSelectionRange(placeholder.start, placeholder.end);
-        }
-      });
+      onSelectPlaceholder(prompt);
     },
-    [textareaRef, textInput],
+    [textInput, onSelectPlaceholder],
   );
   return (
     <Suggestions className="min-h-16 w-full max-w-full justify-center px-4 sm:w-fit sm:px-0">

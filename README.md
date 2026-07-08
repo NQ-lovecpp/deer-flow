@@ -64,12 +64,14 @@ DeerFlow has newly integrated the intelligent search and crawling toolset indepe
     - [Skills \& Tools](#skills--tools)
       - [Claude Code Integration](#claude-code-integration)
     - [Session Goals](#session-goals)
+    - [Manual Context Compaction](#manual-context-compaction)
     - [Sub-Agents](#sub-agents)
     - [Sandbox \& File System](#sandbox--file-system)
     - [Context Engineering](#context-engineering)
     - [Long-Term Memory](#long-term-memory)
   - [Recommended Models](#recommended-models)
   - [Embedded Python Client](#embedded-python-client)
+  - [Scheduled Tasks](#scheduled-tasks)
   - [Terminal Workbench (TUI)](#terminal-workbench-tui)
   - [Documentation](#documentation)
   - [⚠️ Security Notice](#️-security-notice)
@@ -623,11 +625,15 @@ Users can explicitly activate an enabled skill for a single turn by starting the
 
 When you install `.skill` archives through the Gateway, DeerFlow accepts standard optional frontmatter metadata such as `version`, `author`, and `compatibility` instead of rejecting otherwise valid external skills.
 
+Skill installs and agent-managed skill edits run through **SkillScan**, a native deterministic safety scanner before the LLM-based skill scanner. Phase 1 runs offline with no Semgrep/OpenGrep dependency, blocks high-confidence `CRITICAL` findings such as private keys or shell execution, and passes warning findings to the LLM scanner for contextual review. Set `skill_scan.enabled: false` in `config.yaml` to disable only the deterministic analyzers; safe archive extraction and the LLM scanner still run.
+
 Tools follow the same philosophy. DeerFlow comes with a core toolset — web search, web fetch, rendered web capture, file operations, bash execution — and supports custom tools via MCP servers and Python functions. Swap anything. Add anything.
 
 Gateway-generated follow-up suggestions now normalize both plain-string model output and block/list-style rich content before parsing the JSON array response, so provider-specific content wrappers do not silently drop suggestions.
 
 Interrupted first-turn runs still persist a fallback conversation title, so stopping a streaming response does not leave the thread as "Untitled" after refresh.
+
+In the Web UI, completed assistant turns can be branched into a new main conversation. The new thread starts from that turn's checkpoint. Because workspace files are not checkpointed, the branch only receives a best-effort copy of the current workspace when you branch from the latest turn; branching from an older turn keeps just the restored message history so the branch never inherits files that were created in a later part of the conversation.
 
 ```
 # Paths inside the sandbox container
@@ -687,6 +693,10 @@ After each Gateway-backed run, DeerFlow evaluates the visible conversation again
 
 The Web UI shows the active goal above the composer. The same command is available from the TUI and supported IM channels. In the Web UI and supported IM channels, setting `/goal <completion condition>` also starts a run with the condition as the task; status and clear commands only manage goal state.
 
+### Manual Context Compaction
+
+Use `/compact` in the Web UI composer to summarize older context for the current thread. DeerFlow keeps the full chat visible, but future model calls use the compacted summary plus recent messages. The command is ignored when there is not enough history to compact, and it is blocked while the thread has a run in flight.
+
 ### Sub-Agents
 
 Complex tasks rarely fit in a single pass. DeerFlow decomposes them.
@@ -700,6 +710,8 @@ This is how DeerFlow handles tasks that take minutes to hours: a research task m
 DeerFlow doesn't just *talk* about doing things. It has its own computer.
 
 Each task gets its own execution environment with a full filesystem view — skills, workspace, uploads, outputs. The agent reads, writes, and edits files. It can view images and, when configured safely, execute shell commands.
+
+After each run, DeerFlow records a workspace change summary for the run-owned `workspace` and `outputs` directories. The Web UI shows a compact "files changed" badge on the assistant turn; opening it reveals created, modified, and deleted files with text diffs when safe to display. Uploads are excluded because they are user inputs, not agent-generated changes. Large, binary, or sensitive-looking files are shown as metadata only.
 
 With `AioSandboxProvider`, shell execution runs inside isolated containers. With `LocalSandboxProvider`, file tools still map to per-thread directories on the host, but host `bash` is disabled by default because it is not a secure isolation boundary. Re-enable host bash only for fully trusted local workflows. Host bash commands have a wall-clock timeout, and long-lived processes should be started in the background with output redirected to a workspace log.
 
@@ -766,6 +778,29 @@ client.clear_goal("thread-1")
 ```
 
 All dict-returning methods are validated against Gateway Pydantic response models in CI (`TestGatewayConformance`), ensuring the embedded client stays in sync with the HTTP API schemas. See `backend/packages/harness/deerflow/client.py` for full API documentation.
+
+## Scheduled Tasks
+
+DeerFlow now includes a first-class scheduled-task MVP in the workspace.
+
+Current MVP capabilities:
+
+- Manage tasks at `/workspace/scheduled-tasks`
+- Choose whether each scheduled task reuses a thread or creates a fresh thread per run
+- Support `once` and `cron` schedules
+- Run background scheduled executions as non-interactive DeerFlow runs (`ask_clarification` is not exposed there)
+- Use `skip` overlap behavior for due cron executions that collide with an active run on the same reused thread
+- Pause, resume, trigger, inspect history, and delete tasks
+- Execute scheduled work through the normal DeerFlow run lifecycle
+
+Current MVP limits:
+
+- No conversation-created `schedule_task` tool yet
+- No text-only notification jobs
+- No channel or GitHub dispatch targets
+- No `interval` schedule type in this first cut
+
+Enable background polling with `config.yaml -> scheduler.enabled`. Manual trigger uses the same scheduled-task resource and execution path.
 
 ## Terminal Workbench (TUI)
 

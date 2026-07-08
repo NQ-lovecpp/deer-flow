@@ -32,6 +32,7 @@ class FakeSubagentStatus(Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+    MAX_TURNS_REACHED = "max_turns_reached"
 
 
 def _make_runtime(*, app_config=None) -> SimpleNamespace:
@@ -158,6 +159,24 @@ def test_task_result_command_derives_content_from_status_payload():
     assert timed_out_without_detail.additional_kwargs[SUBAGENT_STATUS_KEY] == "timed_out"
     assert timed_out_without_detail.additional_kwargs[SUBAGENT_ERROR_KEY] == "Task timed out."
 
+    # #3875 Phase 2: a turn-capped run is the one status that carries BOTH a
+    # recovered partial result (result_brief + sha256) and a cap notice
+    # (error), and the model-visible content leads with the partial work.
+    max_turns = _task_tool_message(
+        task_tool_module._task_result_command(
+            tool_call_id="tc-max-turns",
+            status="max_turns_reached",
+            result="investigated 3 of 5 sources",
+            error="Reached max_turns=150",
+        )
+    )
+    assert max_turns.content.startswith("Task reached max turns")
+    assert "investigated 3 of 5 sources" in max_turns.content
+    assert max_turns.additional_kwargs[SUBAGENT_STATUS_KEY] == "max_turns_reached"
+    assert max_turns.additional_kwargs[SUBAGENT_RESULT_BRIEF_KEY] == "investigated 3 of 5 sources"
+    assert len(max_turns.additional_kwargs[SUBAGENT_RESULT_SHA256_KEY]) == 64
+    assert max_turns.additional_kwargs[SUBAGENT_ERROR_KEY] == "Reached max_turns=150"
+
 
 async def _no_sleep(_: float) -> None:
     return None
@@ -184,6 +203,47 @@ def test_task_tool_returns_error_for_unknown_subagent(monkeypatch):
     assert message.content == "Task failed. Error: Unknown subagent type 'general-purpose'. Available: general-purpose"
     assert message.additional_kwargs[SUBAGENT_STATUS_KEY] == "failed"
     assert message.additional_kwargs[SUBAGENT_ERROR_KEY] == "Unknown subagent type 'general-purpose'. Available: general-purpose"
+
+
+def test_task_tool_forwards_channel_user_id_to_executor(monkeypatch):
+    """The IM-channel sender identity must survive delegation: in group chats
+    one thread serves many senders, so a subagent's bash commands need the
+    dispatching turn's channel_user_id (same propagation rule as user_role /
+    oauth attribution)."""
+    runtime = _make_runtime()
+    runtime.context["channel_user_id"] = "ou_group_sender_1"
+    captured = {}
+
+    class DummyExecutor:
+        def __init__(self, **kwargs):
+            captured["executor_kwargs"] = kwargs
+
+        def execute_async(self, prompt, task_id=None):
+            return task_id or "generated-task-id"
+
+    monkeypatch.setattr(task_tool_module, "SubagentStatus", FakeSubagentStatus)
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", DummyExecutor)
+    monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda _: _make_subagent_config())
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_background_task_result",
+        lambda _: _make_result(FakeSubagentStatus.COMPLETED, result="done"),
+    )
+    monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: lambda _event: None)
+    monkeypatch.setattr(task_tool_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [])
+
+    output = _run_task_tool(
+        runtime=runtime,
+        description="运行子任务",
+        prompt="collect diagnostics",
+        subagent_type="general-purpose",
+        tool_call_id="tc-channel-id",
+    )
+
+    message = _task_tool_message(output)
+    assert message.content == "Task Succeeded. Result: done"
+    assert captured["executor_kwargs"]["channel_user_id"] == "ou_group_sender_1"
 
 
 def test_task_tool_rejects_bash_subagent_when_host_bash_disabled(monkeypatch):
@@ -670,6 +730,45 @@ def test_task_tool_returns_timed_out_message(monkeypatch):
     assert message.additional_kwargs[SUBAGENT_ERROR_KEY] == "timeout"
     assert events[-1]["type"] == "task_timed_out"
     assert events[-1]["error"] == "timeout"
+
+
+def test_task_tool_returns_max_turns_reached_message(monkeypatch):
+    """#3875 Phase 2: a MAX_TURNS_REACHED subagent surfaces a distinct
+    ``Task reached max turns`` message that carries the recovered partial
+    result, and stamps ``result_brief`` + the cap notice on ``error`` — the
+    one status that carries both. The polling loop emits ``task_failed`` so
+    the card transitions out of running; the structured status is the reason."""
+    config = _make_subagent_config()
+    events = []
+
+    monkeypatch.setattr(task_tool_module, "SubagentStatus", FakeSubagentStatus)
+    monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda _: config)
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_background_task_result",
+        lambda _: _make_result(FakeSubagentStatus.MAX_TURNS_REACHED, result="investigated 3 of 5 sources", error="Reached max_turns=50"),
+    )
+    monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: events.append)
+    monkeypatch.setattr(task_tool_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [])
+
+    output = _run_task_tool(
+        runtime=_make_runtime(),
+        description="执行任务",
+        prompt="do capped work",
+        subagent_type="general-purpose",
+        tool_call_id="tc-max-turns",
+    )
+
+    message = _task_tool_message(output)
+    assert message.content.startswith("Task reached max turns")
+    assert "investigated 3 of 5 sources" in message.content
+    assert str(config.max_turns) in message.content
+    assert message.additional_kwargs[SUBAGENT_STATUS_KEY] == "max_turns_reached"
+    assert message.additional_kwargs[SUBAGENT_RESULT_BRIEF_KEY] == "investigated 3 of 5 sources"
+    assert len(message.additional_kwargs[SUBAGENT_RESULT_SHA256_KEY]) == 64
+    assert message.additional_kwargs[SUBAGENT_ERROR_KEY] == f"Reached max_turns={config.max_turns}"
+    assert events[-1]["type"] == "task_failed"
 
 
 def test_task_tool_polling_safety_timeout(monkeypatch):

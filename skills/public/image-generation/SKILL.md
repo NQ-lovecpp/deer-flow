@@ -1,382 +1,161 @@
 ---
 name: image-generation
-description: Use this skill when the user requests to generate, create, imagine, or visualize images including characters, scenes, products, or any visual content. Supports plain-text prompts, reference images, and explicit CLI controls for local ComfyUI/Qwen generation.
+description: Use this skill when the user requests image generation, text-to-image, image editing, product/portrait/scene visuals, reference-image composition, or local ComfyUI/Qwen workflows. Defaults to local Qwen Image for generation and Qwen Image Edit 2509 for image modification, with Qwen Image Layered available as an explicit experimental workflow.
 ---
 
 # Image Generation Skill
 
-## Overview
+## Default Route
 
-This skill generates images using a prompt file and a Python script. Prefer plain-text prompt files (`.txt`) for local ComfyUI/Qwen workflows. JSON is only a compatibility format for older/provider-specific prompts; it does not control ComfyUI sampling quality.
+Use local ComfyUI first unless the user explicitly asks for a remote provider.
 
-## Core Capabilities
+- Text-to-image with no reference images: use Qwen Image 2512 through `IMAGE_GENERATION_PROVIDER=comfy` or `comfy_qwen_image`.
+- Image modification with one to three real reference images: use Qwen Image Edit 2509 through `IMAGE_GENERATION_PROVIDER=comfy` or `comfy_qwen_edit`.
+- Layer decomposition or layered generation: treat Qwen Image Layered as experimental. Use the bundled UI workflow in ComfyUI first; do not claim the CLI path is production-ready until `generate.py` has a layered API builder.
+- Do not use Qwen Image Edit with a blank dummy canvas for pure text-to-image. Omit `--reference-images` so the script routes to Qwen Image.
 
-- Create concise plain-text prompts for AIGC image generation
-- Support multiple reference images for style/composition guidance
-- Generate pure text-to-image locally with Qwen Image 2512 when `IMAGE_GENERATION_PROVIDER=comfy` and no reference images are supplied
-- Edit an uploaded/reference image locally with Qwen Image Edit 2511 when reference images are supplied
-- Generate images through automated Python script execution
-- Route local text-to-image and image-editing differently so Qwen Edit is not misused as a blank-canvas generator
-- Handle various image generation scenarios (character design, scenes, products, image editing, product retouching, etc.)
+Prefer plain `.txt` prompt files. JSON prompt files are accepted for compatibility, but local Qwen sampling controls must be CLI flags, not JSON fields.
 
-## Workflow
+## Required Preflight
 
-### Step 1: Understand Requirements
-
-When a user requests image generation, identify:
-
-- Subject/content: What should be in the image
-- Style preferences: Art style, mood, color palette
-- Technical specs: Aspect ratio, composition, lighting
-- Reference images: Any images to guide generation or edit. Uploaded images are usually under `/mnt/user-data/uploads/`.
-- For image editing requests, pass the target image as the first `--reference-images` argument. Do not claim image editing is unavailable when the local provider is `comfy_qwen_edit`.
-- You don't need to check the folder under `/mnt/user-data` unless you need to find an uploaded image path.
-
-### Step 2: Create Prompt File
-
-Generate a plain-text prompt file in `/mnt/user-data/workspace/` with naming pattern: `{descriptive-name}.txt`. Put the visual instruction directly in prose.
-
-Use JSON only when a specific non-local provider requires it. Do not put sampling controls such as quality, steps, CFG, denoise, LoRA, seed, sampler, or scheduler inside JSON; local ComfyUI/Qwen ignores those as real controls. Use CLI arguments instead.
-
-### Step 3: Execute Generation
-
-Call the Python script:
-```bash
-python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/prompt-file.txt \
-  --reference-images /path/to/ref1.jpg /path/to/ref2.png \
-  --output-file /mnt/user-data/outputs/generated-image.jpg
-  --aspect-ratio 16:9
-```
-
-Parameters:
-
-- `--prompt-file`: Absolute path to a prompt file (plain `.txt` preferred; JSON only for compatibility)
-- `--reference-images`: Absolute paths to reference images (optional, space-separated)
-- `--output-file`: Absolute path to output image file (required)
-- `--aspect-ratio`: Aspect ratio of the generated image (optional, default: 16:9)
-
-[!NOTE]
-Do NOT read the python file, just call it with the parameters. For local ComfyUI/Qwen, CLI flags are the source of truth for quality and sampling behavior; JSON fields like `technical.quality` are not real controls.
-
-
-## Local ComfyUI / Qwen Provider
-
-Use `IMAGE_GENERATION_PROVIDER=comfy` for the normal local route. The script automatically selects the right local workflow: with `--reference-images` it uses Qwen Image Edit 2511; without reference images it uses Qwen Image 2512 text-to-image. Do not use Qwen Image Edit for pure text-to-image by inventing a blank canvas; that produces noisy, unusable results. Use `IMAGE_GENERATION_PROVIDER=comfy_qwen_edit` only when you have 1-3 real reference/input images to edit or guide.
-
-Use plain-text prompt files and explicit `--qwen-*` CLI parameters for Qwen generation/editing; do not encode Qwen quality controls in JSON.
-
-### Spark Scheduling And Memory Budget
-
-Before local ComfyUI generation, inspect Spark resource state:
+Before local generation, inspect Spark/Comfy state:
 
 ```bash
-COMFYUI_URL=http://127.0.0.1:8188 python /mnt/skills/public/image-generation/scripts/comfy_resource_status.py
+COMFYUI_URL=http://127.0.0.1:8188 \
+  python /mnt/skills/public/image-generation/scripts/comfy_resource_status.py
 ```
 
 Scheduling rules:
 
-- Do not start a new job when ComfyUI has a running or pending queue item unless the user explicitly asks for parallel generation.
-- Prefer `IMAGE_GENERATION_PROVIDER=comfy`; it selects Qwen Image 2512 for no-reference generation and Qwen Image Edit 2511 for reference-image editing.
-- Keep `--memory-budget balanced` unless the user asks otherwise. Use `conservative` for long batch work or when free RAM is below 48GiB; use `relaxed` only for a single high-quality foreground task; use `off` only for debugging.
-- The script also enforces the budget before posting to ComfyUI. It takes a local file lock, reads `/system_stats` and `/queue`, prints a memory snapshot, blocks when the queue is above budget, and scales work down when Spark free RAM is low.
+- Do not start a job when ComfyUI has a running or pending queue item unless the user explicitly asks for parallel generation.
+- Keep `--memory-budget balanced` by default.
+- Use `--memory-budget conservative` for batches, background work, or when free system RAM is below 56GiB.
+- Use `--memory-budget relaxed` only for one foreground high-quality job after checking the queue.
+- Use `--memory-budget off` only for debugging.
 
-Budget environment overrides:
+Budget environment defaults enforced by `generate.py`:
 
-- `SPARK_IMAGE_MEMORY_BUDGET=off|relaxed|balanced|conservative`
-- `SPARK_IMAGE_MIN_SYSTEM_FREE_GB` default `24`
-- `SPARK_IMAGE_LOW_SYSTEM_FREE_GB` default `48`
-- `SPARK_IMAGE_MAX_QUEUE_ITEMS` default `0`
-- `SPARK_IMAGE_MAX_PIXELS` caps Qwen Image 2512 text-to-image pixels; default `0` at balanced/relaxed budgets and `1048576` when conserving
-- `SPARK_IMAGE_LOCK=0` disables the per-machine ComfyUI generation lock for deliberate parallel testing
+- `SPARK_IMAGE_MEMORY_BUDGET=balanced`
+- `SPARK_IMAGE_MIN_SYSTEM_FREE_GB=32`
+- `SPARK_IMAGE_LOW_SYSTEM_FREE_GB=56`
+- `SPARK_IMAGE_MAX_QUEUE_ITEMS=0`
+- `SPARK_IMAGE_LOCK=1`
 
-### Quantization Choice
+## Model Defaults
 
-Prefer official ComfyUI FP8-family weights on Spark:
+Use these Spark defaults:
 
-- Qwen Image 2512: `qwen_image_2512_fp8_e4m3fn.safetensors`
-- Qwen Image Edit 2511: `qwen_image_edit_2511_fp8mixed.safetensors`
-- Qwen Image Layered: `qwen_image_layered_fp8mixed.safetensors`
+- Qwen Image 2512 diffusion: `qwen_image_2512_fp8_e4m3fn.safetensors`
+- Qwen Image Edit 2509 diffusion: `qwen_image_edit_2509_fp8_e4m3fn.safetensors`
+- Qwen Image Edit 2509 Lightning LoRA for explicit fast previews: `Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors`
+- Qwen Image Layered diffusion: `qwen_image_layered_fp8mixed.safetensors`
 - Shared text encoder: `qwen_2.5_vl_7b_fp8_scaled.safetensors`
+- Standard VAE: `qwen_image_vae.safetensors`
+- Layered VAE: `qwen_image_layered_vae.safetensors`
 
-Use bf16 only when quality comparison or model-debugging justifies the memory cost. Treat int8/GGUF as a separate low-memory compatibility route, not the default, because these bundled ComfyUI workflows and API builders use native diffusion/UNET loaders that align with the official FP8-family files.
+Prefer FP8-family weights on Spark. Use bf16 only for deliberate comparison or debugging. Treat 2511 as an explicit fallback via `COMFYUI_QWEN_UNET=qwen_image_edit_2511_fp8mixed.safetensors`, not the default edit route.
 
-Use it for requests such as:
+## Generate A New Image
 
-- Change text, dates, colors, background, clothing, or style in an uploaded image
-- Preserve the original image style while changing specified details
-- Combine or reference multiple uploaded images, such as person + product, person + scene, or up to three visual references
-- Product retouching, poster edits, meme/text edits, portrait style transfer, and other user-owned image edits
-
-Do not claim image input is unavailable. Uploaded files under `/mnt/user-data/uploads/` should be passed as `--reference-images`. If there is no uploaded/reference image, do not force Qwen Image Edit; call the script with `IMAGE_GENERATION_PROVIDER=comfy` and no `--reference-images` so it routes to Qwen Image 2512.
-
-Example pure text-to-image command with Qwen Image 2512:
+Create a prompt file, then call `generate.py` without reference images:
 
 ```bash
-cat > /mnt/user-data/workspace/logo-prompt.txt <<EOF
-A clean vector-style logo of 1I/ʻOumuamua, elongated interstellar object silhouette, elegant orbital arc, high contrast, minimal shapes, professional astronomy brand mark, no text.
+cat > /mnt/user-data/workspace/image.txt <<'EOF'
+A cinematic product photo of a matte black espresso machine on a stainless counter, morning side light, realistic reflections, premium editorial photography, no text.
 EOF
 
-IMAGE_GENERATION_PROVIDER=comfy python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/logo-prompt.txt \
-  --output-file /mnt/user-data/outputs/oumuamua-logo.jpg \
-  --aspect-ratio 1:1 \
-  --qwen-preset quality
+IMAGE_GENERATION_PROVIDER=comfy \
+  python /mnt/skills/public/image-generation/scripts/generate.py \
+    --prompt-file /mnt/user-data/workspace/image.txt \
+    --output-file /mnt/user-data/outputs/image.png \
+    --aspect-ratio 4:3 \
+    --qwen-preset quality \
+    --memory-budget balanced
 ```
 
-Example balanced-quality image editing command:
+Qwen Image defaults: `quality` preset, about 50 steps, CFG 4.0, official Qwen Image dimensions for the requested aspect ratio.
+
+## Edit Or Compose Images
+
+Pass the main image as the first reference. Pass up to two more images as secondary references.
 
 ```bash
-cat > /mnt/user-data/workspace/edit-prompt.txt <<'EOF'
-Replace the dates "19", "20", "21" with "3", "4", "5" respectively. Keep the same style, font, layout, and background.
+cat > /mnt/user-data/workspace/edit.txt <<'EOF'
+Replace the background with a clean bright kitchen. Keep the product shape, logo placement, camera angle, and realistic reflections unchanged.
 EOF
 
-IMAGE_GENERATION_PROVIDER=comfy_qwen_edit python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/edit-prompt.txt \
-  --reference-images /mnt/user-data/uploads/input.jpeg \
-  --output-file /mnt/user-data/outputs/edited-image.jpg \
-  --aspect-ratio 16:9 \
-  --qwen-preset balanced
+IMAGE_GENERATION_PROVIDER=comfy_qwen_edit \
+  python /mnt/skills/public/image-generation/scripts/generate.py \
+    --prompt-file /mnt/user-data/workspace/edit.txt \
+    --reference-images /mnt/user-data/uploads/input.png \
+    --output-file /mnt/user-data/outputs/edited.png \
+    --aspect-ratio 4:3 \
+    --qwen-preset balanced \
+    --memory-budget balanced
 ```
 
-Multi-image reference example:
+For multi-image composition:
 
 ```bash
-IMAGE_GENERATION_PROVIDER=comfy_qwen_edit python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/product-poster.txt \
-  --reference-images /mnt/user-data/uploads/person.jpg /mnt/user-data/uploads/product.png /mnt/user-data/uploads/scene.jpg \
-  --output-file /mnt/user-data/outputs/product-poster.jpg \
-  --qwen-preset balanced
+IMAGE_GENERATION_PROVIDER=comfy_qwen_edit \
+  python /mnt/skills/public/image-generation/scripts/generate.py \
+    --prompt-file /mnt/user-data/workspace/composite.txt \
+    --reference-images /mnt/user-data/uploads/person.jpg /mnt/user-data/uploads/product.png /mnt/user-data/uploads/scene.jpg \
+    --output-file /mnt/user-data/outputs/composite.png \
+    --qwen-preset balanced
 ```
 
-Qwen preset guidance:
+Qwen Image Edit 2509 defaults: `balanced` preset, 20 steps, CFG 4.0, denoise 1.0, 0.5MP input scaling, LoRA off. Use `--qwen-use-lora --qwen-preset fast` only for explicit quick preview experiments.
 
-- For Qwen Image 2512 text-to-image, `--qwen-preset quality` is the default and uses about 50 steps / CFG 4.0 at the official 2512 aspect-ratio dimensions.
-- For Qwen Image Edit 2511, `--qwen-preset balanced` is the default and recommended first try. It disables Lightning LoRA and uses about 20 steps / CFG 4.0 / denoise 1.0 / 0.5MP / `weight_dtype=default`.
-- `--qwen-preset fast` is for quick smoke previews only. It keeps Lightning LoRA off by default on Spark, because the 2512 Lightning LoRA can be less stable than the native FP8 path.
-- Use `--qwen-use-lora` only for explicit Lightning LoRA experiments after checking the queue and memory budget.
+## Layered Experiments
 
-Useful Qwen controls:
+Use Qwen Image Layered only when the user asks for layers, decomposition, foreground/background separation, or editable layered outputs.
 
-- `--qwen-steps`: sampling steps
-- `--qwen-cfg`: CFG / true CFG strength
-- `--qwen-denoise`: how much to change the source image; lower preserves more, higher changes more
-- `--qwen-seed`: fixed seed for reproducibility
-- `--qwen-sampler` and `--qwen-scheduler`: ComfyUI KSampler controls
-- `--qwen-shift`: ModelSamplingAuraFlow shift
-- `--qwen-megapixels`: pre-scale before Qwen conditioning/VAE; defaults come from the selected preset
-- `--qwen-weight-dtype`: UNETLoader weight dtype; default is `default`. Do not use `fp8_e4m3fn_fast` unless the user explicitly asks for an experimental preview.
-- `--qwen-use-lora` / `--qwen-no-lora`: force Lightning LoRA on or off
-- `--qwen-lora-name` and `--qwen-lora-strength`: override LoRA file and strength
+Current status:
 
-Important notes for this local provider:
+- Model files are listed in `workflows/comfy/model-manifest.json`.
+- The UI workflow is `workflows/comfy/ui/qwen-image-layered.json`.
+- The ComfyUI node `EmptyQwenImageLayeredLatentImage` is available on Spark.
+- The CLI script does not yet provide a stable layered API builder. If `IMAGE_GENERATION_PROVIDER=comfy_qwen_layered` is requested, report that the model should be tried through the bundled ComfyUI workflow first.
 
-- `IMAGE_GENERATION_PROVIDER=comfy` is the default local route. With reference images it uses Qwen Image Edit 2511; without reference images it uses Qwen Image 2512.
-- `IMAGE_GENERATION_PROVIDER=comfy_qwen_image` forces Qwen Image 2512 text-to-image. It ignores reference images.
-- Qwen Image Edit requires real reference/input images. Do not use blank, generated, or dummy images just to satisfy the API.
-- Qwen Image Edit works best with 1-3 input images. If more are supplied, use the most relevant first three.
-- The first reference image is the main image to edit and is encoded into the edit latent. The second and third images are additional visual references.
-- The local workflow passes the same images and VAE to both positive and negative Qwen conditioning. This avoids the broken colorful-noise behavior seen with incomplete conditioning.
-- Do not default to `fp8_e4m3fn_fast`; on this machine it has produced colorful mosaic outputs. Use the default weight dtype unless explicitly experimenting.
-- Removing labels, stickers, or large occluding objects is high risk because Qwen Image Edit may redraw brand text and object structure. For strict local preservation, use or request a mask/inpaint workflow instead.
-- Qwen Image Edit needs enough free unified GPU memory. If generation appears stuck, check ComfyUI queue/logs and available VRAM.
-- Do not use this skill to remove watermarks or copyright marks from third-party images. For ordinary user-owned edits, proceed normally.
+## Controls
 
-## Bundled ComfyUI Workflows
+Useful CLI controls:
 
-Use the bundled workflow files when inspecting or authoring in ComfyUI itself:
+- `--qwen-preset fast|balanced|quality`
+- `--qwen-steps`
+- `--qwen-cfg`
+- `--qwen-denoise`
+- `--qwen-seed`
+- `--qwen-sampler`
+- `--qwen-scheduler`
+- `--qwen-shift`
+- `--qwen-megapixels`
+- `--qwen-weight-dtype`
+- `--qwen-use-lora` / `--qwen-no-lora`
+- `--qwen-lora-name`
+- `--qwen-lora-strength`
+- `--memory-budget off|relaxed|balanced|conservative`
 
-- `workflows/comfy/ui/qwen-image-2512.json`: official ComfyUI UI/subgraph workflow for Qwen Image 2512 text-to-image.
-- `workflows/comfy/ui/qwen-image-edit-2511.json`: official ComfyUI UI/subgraph workflow for Qwen Image Edit 2511.
-- `workflows/comfy/ui/qwen-image-layered.json`: official ComfyUI UI/subgraph workflow for Qwen Image Layered.
-- `workflows/comfy/model-manifest.json`: ModelScope download URLs and target ComfyUI model paths.
+Do not default to `fp8_e4m3fn_fast`; it has produced unstable colorful mosaic outputs on Spark. Use `weight_dtype=default` unless explicitly experimenting.
 
-These UI workflow JSON files are for ComfyUI authoring and visual inspection. Do not post them directly to `/prompt`; use `scripts/generate.py`, which builds API workflows dynamically.
+## Safety And Failure Modes
 
-## Character Generation Example
+- Uploaded/reference files are usually under `/mnt/user-data/uploads/`.
+- Validate that the first reference image is the actual image to edit.
+- If more than three references are supplied, use the most relevant first three.
+- For strict removal of labels, stickers, watermarks, or large occluders, ask for or create a mask/inpaint workflow instead of relying on generic edit prompting.
+- Do not remove watermarks or copyright marks from third-party images.
+- If generation appears stuck, check `/queue`, `/system_stats`, and ComfyUI logs before retrying.
 
-User request: "Create a Tokyo street style woman character in 1990s"
+## Bundled Resources
 
-Create prompt file: `/mnt/user-data/workspace/asian-woman.json`
-```json
-{
-  "characters": [{
-    "gender": "female",
-    "age": "mid-20s",
-    "ethnicity": "Japanese",
-    "body_type": "slender, elegant",
-    "facial_features": "delicate features, expressive eyes, subtle makeup with emphasis on lips, long dark hair partially wet from rain",
-    "clothing": "stylish trench coat, designer handbag, high heels, contemporary Tokyo street fashion",
-    "accessories": "minimal jewelry, statement earrings, leather handbag",
-    "era": "1990s"
-  }],
-  "negative_prompt": "blurry face, deformed, low quality, overly sharp digital look, oversaturated colors, artificial lighting, studio setting, posed, selfie angle",
-  "style": "Leica M11 street photography aesthetic, film-like rendering, natural color palette with slight warmth, bokeh background blur, analog photography feel",
-  "composition": "medium shot, rule of thirds, subject slightly off-center, environmental context of Tokyo street visible, shallow depth of field isolating subject",
-  "lighting": "neon lights from signs and storefronts, wet pavement reflections, soft ambient city glow, natural street lighting, rim lighting from background neons",
-  "color_palette": "muted naturalistic tones, warm skin tones, cool blue and magenta neon accents, desaturated compared to digital photography, film grain texture"
-}
-```
-
-Execute generation:
-```bash
-python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/asian-woman.json \
-  --output-file /mnt/user-data/outputs/asian-woman-01.jpg \
-  --aspect-ratio 2:3
-```
-
-With reference images:
-```json
-{
-  "characters": [{
-    "gender": "based on [Image 1]",
-    "age": "based on [Image 1]",
-    "ethnicity": "human from [Image 1] adapted to Star Wars universe",
-    "body_type": "based on [Image 1]",
-    "facial_features": "matching [Image 1] with slight weathered look from space travel",
-    "clothing": "Star Wars style outfit - worn leather jacket with utility vest, cargo pants with tactical pouches, scuffed boots, belt with holster",
-    "accessories": "blaster pistol on hip, comlink device on wrist, goggles pushed up on forehead, satchel with supplies, personal vehicle based on [Image 2]",
-    "era": "Star Wars universe, post-Empire era"
-  }],
-  "prompt": "Character inspired by [Image 1] standing next to a vehicle inspired by [Image 2] on a bustling alien planet street in Star Wars universe aesthetic. Character wearing worn leather jacket with utility vest, cargo pants with tactical pouches, scuffed boots, belt with blaster holster. The vehicle adapted to Star Wars aesthetic with weathered metal panels, repulsor engines, desert dust covering, parked on the street. Exotic alien marketplace street with multi-level architecture, weathered metal structures, hanging market stalls with colorful awnings, alien species walking by as background characters. Twin suns casting warm golden light, atmospheric dust particles in air, moisture vaporators visible in distance. Gritty lived-in Star Wars aesthetic, practical effects look, film grain texture, cinematic composition.",
-  "negative_prompt": "clean futuristic look, sterile environment, overly CGI appearance, fantasy medieval elements, Earth architecture, modern city",
-  "style": "Star Wars original trilogy aesthetic, lived-in universe, practical effects inspired, cinematic film look, slightly desaturated with warm tones",
-  "composition": "medium wide shot, character in foreground with alien street extending into background, environmental storytelling, rule of thirds",
-  "lighting": "warm golden hour lighting from twin suns, rim lighting on character, atmospheric haze, practical light sources from market stalls",
-  "color_palette": "warm sandy tones, ochre and sienna, dusty blues, weathered metals, muted earth colors with pops of alien market colors",
-  "technical": {
-    "aspect_ratio": "9:16",
-    "quality": "high",
-    "detail_level": "highly detailed with film-like texture"
-  }
-}
-```
-```bash
-python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/star-wars-scene.json \
-  --reference-images /mnt/user-data/uploads/character-ref.jpg /mnt/user-data/uploads/vehicle-ref.jpg \
-  --output-file /mnt/user-data/outputs/star-wars-scene-01.jpg \
-  --aspect-ratio 16:9
-```
-
-## Common Scenarios
-
-Use different JSON schemas for different scenarios.
-
-**Character Design**:
-- Physical attributes (gender, age, ethnicity, body type)
-- Facial features and expressions
-- Clothing and accessories
-- Historical era or setting
-- Pose and context
-
-**Scene Generation**:
-- Environment description
-- Time of day, weather
-- Mood and atmosphere
-- Focal points and composition
-
-**Product Visualization**:
-- Product details and materials
-- Lighting setup
-- Background and context
-- Presentation angle
-
-## Specific Templates
-
-Read the following template file only when matching the user request.
-
-- [Doraemon Comic](templates/doraemon.md)
-
-## Output Handling
-
-After generation:
-
-- Images are typically saved in `/mnt/user-data/outputs/`
-- Share generated images with user using present_files tool
-- Provide brief description of the generation result
-- Offer to iterate if adjustments needed
-
-## Tips: Enhancing Generation with Reference Images
-
-For scenarios where visual accuracy is critical, **use the `image_search` tool first** to find reference images before generation.
-
-**Recommended scenarios for using image_search tool:**
-- **Character/Portrait Generation**: Search for similar poses, expressions, or styles to guide facial features and body proportions
-- **Specific Objects or Products**: Find reference images of real objects to ensure accurate representation
-- **Architectural or Environmental Scenes**: Search for location references to capture authentic details
-- **Fashion and Clothing**: Find style references to ensure accurate garment details and styling
-
-**Example workflow:**
-1. Call the `image_search` tool to find suitable reference images:
-   ```
-   image_search(query="Japanese woman street photography 1990s", size="Large")
-   ```
-2. Download the returned image URLs to local files
-3. Use the downloaded images as `--reference-images` parameter in the generation script
-
-This approach significantly improves generation quality by providing the model with concrete visual guidance rather than relying solely on text descriptions.
-
-## Prompt Format Guidance
-
-Prefer `.txt` prompts for all local ComfyUI/Qwen work. JSON prompt files are still accepted for backwards compatibility and remote provider workflows, but local sampling controls must be CLI flags:
-
-```bash
-# Good: prompt meaning in text, generation controls in CLI
-IMAGE_GENERATION_PROVIDER=comfy_qwen_edit python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/edit.txt \
-  --reference-images /mnt/user-data/uploads/input.png \
-  --output-file /mnt/user-data/outputs/edit.png \
-  --qwen-preset quality \
-  --qwen-steps 40 \
-  --qwen-cfg 4.0 \
-  --qwen-denoise 0.9
-```
-
-For no-image local generation, use `IMAGE_GENERATION_PROVIDER=comfy` or force `comfy_qwen_image`, and omit `--reference-images`:
-
-```bash
-IMAGE_GENERATION_PROVIDER=comfy python /mnt/skills/public/image-generation/scripts/generate.py \
-  --prompt-file /mnt/user-data/workspace/logo.txt \
-  --output-file /mnt/user-data/outputs/logo.png \
-  --aspect-ratio 1:1 \
-  --qwen-preset quality \
-  --qwen-steps 40 \
-  --qwen-cfg 4.0
-```
-
-Avoid relying on JSON fields such as `technical.quality`, `steps`, `cfg`, or `denoise`; they are just text unless passed through CLI flags.
-
-## Providers (Gemini / MiniMax / Local ComfyUI)
-
-This skill auto-selects the provider by environment variables (no CLI change):
-
-- `IMAGE_GENERATION_PROVIDER=comfy` → local ComfyUI auto-route: Qwen Image 2512 without references, Qwen Image Edit 2511 with references.
-- `IMAGE_GENERATION_PROVIDER=comfy_qwen_image` → force local Qwen Image 2512 text-to-image.
-- `IMAGE_GENERATION_PROVIDER=comfy_qwen_edit` → force local Qwen Image Edit 2511 and require real reference images.
-- `IMAGE_GENERATION_PROVIDER=comfy_sd15` → explicit old SD1.5 fallback only when the user asks for it.
-- `GEMINI_API_KEY` set → use Gemini when no explicit provider is set.
-- Only `MINIMAX_API_KEY` set → use MiniMax (`/v1/image_generation`, model `image-01`).
-- Force one explicitly with `IMAGE_GENERATION_PROVIDER=gemini|minimax|comfy|comfy_qwen_image|comfy_qwen_edit|comfy_sd15`. Prefer `comfy` for local work.
-
-MiniMax optional overrides: `MINIMAX_API_HOST` (default `https://api.minimaxi.com`),
-`MINIMAX_IMAGE_MODEL` (default `image-01`). Reference images are sent as the MiniMax
-`subject_reference` character image. The CLI and `--prompt-file` / `--reference-images`
-/ `--output-file` / `--aspect-ratio` arguments are identical for both providers.
-
-**MiniMax prompt handling (provider-internal).** Authoring is provider-agnostic — write
-the same structured JSON regardless of which provider is active. MiniMax `image-01`
-consumes a single text string, so the MiniMax path itself sends only the JSON `prompt`
-field (the other fields such as `style` / `composition` / `negative_prompt` apply to the
-Gemini path) and enables `prompt_optimizer` so MiniMax expands it server-side. MiniMax
-caps that prompt at 1500 characters; if the `prompt` field is longer, the script returns
-an error instead of calling the API. The Gemini path receives the full structured JSON.
-
-## Notes
-
-- Always use English for prompts regardless of user's language
-- Prefer plain text prompts for local ComfyUI/Qwen; JSON is optional compatibility, not a quality-control interface
-- Reference images enhance generation quality significantly
-- Iterative refinement is normal for optimal results
-- For character generation, include the detailed character object plus a consolidated prompt field
+- `scripts/generate.py`: provider routing, Qwen API workflow construction, Spark memory budget enforcement, and output download.
+- `scripts/comfy_resource_status.py`: queue, RAM, and VRAM snapshot.
+- `scripts/download_qwen_comfy_models.sh`: ModelScope model downloader.
+- `workflows/comfy/model-manifest.json`: model file manifest and target paths.
+- `workflows/comfy/ui/qwen-image-2512.json`: Qwen Image UI workflow.
+- `workflows/comfy/ui/qwen-image-edit-2509.json`: Qwen Image Edit 2509 UI workflow.
+- `workflows/comfy/ui/qwen-image-edit-2511.json`: optional 2511 fallback workflow reference.
+- `workflows/comfy/ui/qwen-image-layered.json`: Qwen Image Layered UI workflow.
+- `templates/doraemon.md`: read only for Doraemon comic-style requests.

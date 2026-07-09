@@ -20,7 +20,7 @@ MINIMAX_PROMPT_MAX_CHARS = 1500
 QWEN_EDIT_PRESETS = {
     "fast": {"steps": 4, "cfg": 1.0, "denoise": 1.0, "megapixels": 0.5, "weight_dtype": "default", "use_lora": True},
     "balanced": {"steps": 20, "cfg": 4.0, "denoise": 1.0, "megapixels": 0.5, "weight_dtype": "default", "use_lora": False},
-    "quality": {"steps": 40, "cfg": 4.0, "denoise": 1.0, "megapixels": 1.0, "weight_dtype": "default", "use_lora": False},
+    "quality": {"steps": 36, "cfg": 4.0, "denoise": 1.0, "megapixels": 0.75, "weight_dtype": "default", "use_lora": False},
 }
 
 QWEN_IMAGE_PRESETS = {
@@ -490,8 +490,8 @@ def _apply_spark_memory_budget(kind: str, opts: dict, options: dict | None, aspe
         raise RuntimeError(f"ComfyUI queue has {queued} item(s), above budget {max_queue}; wait or raise SPARK_IMAGE_MAX_QUEUE_ITEMS")
 
     ram_free_gb = _gb(snapshot["ram_free"])
-    min_free_gb = _float_env("SPARK_IMAGE_MIN_SYSTEM_FREE_GB", 24.0)
-    low_free_gb = _float_env("SPARK_IMAGE_LOW_SYSTEM_FREE_GB", 48.0)
+    min_free_gb = _float_env("SPARK_IMAGE_MIN_SYSTEM_FREE_GB", 32.0)
+    low_free_gb = _float_env("SPARK_IMAGE_LOW_SYSTEM_FREE_GB", 56.0)
     if ram_free_gb is not None and ram_free_gb < min_free_gb:
         raise MemoryError(f"Spark free RAM is {ram_free_gb:.1f}GiB, below budget minimum {min_free_gb:.1f}GiB")
 
@@ -608,10 +608,10 @@ def _resolve_qwen_edit_options(options: dict | None = None) -> dict:
 
     return {
         "preset": preset,
-        "unet": os.getenv("COMFYUI_QWEN_UNET", "qwen_image_edit_2511_fp8mixed.safetensors"),
+        "unet": os.getenv("COMFYUI_QWEN_UNET", "qwen_image_edit_2509_fp8_e4m3fn.safetensors"),
         "clip": os.getenv("COMFYUI_QWEN_CLIP", "qwen_2.5_vl_7b_fp8_scaled.safetensors"),
         "vae": os.getenv("COMFYUI_QWEN_VAE", "qwen_image_vae.safetensors"),
-        "lora_name": _qwen_option(options, "lora_name", "COMFYUI_QWEN_LORA", "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", str),
+        "lora_name": _qwen_option(options, "lora_name", "COMFYUI_QWEN_LORA", "Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors", str),
         "lora_strength": _qwen_option(options, "lora_strength", "COMFYUI_QWEN_LORA_STRENGTH", 1.0, float),
         "use_lora": use_lora,
         "weight_dtype": _qwen_option(options, "weight_dtype", "COMFYUI_QWEN_WEIGHT_DTYPE", defaults["weight_dtype"], str),
@@ -791,6 +791,11 @@ def generate_image(
     if provider in ("comfy_qwen_image", "qwen_image", "qwen-image"):
         with _comfy_generation_lock():
             return _generate_image_comfy_qwen_image(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
+    if provider in ("comfy_qwen_layered", "qwen_image_layered", "qwen-layered"):
+        raise NotImplementedError(
+            "Qwen Image Layered is installed for ComfyUI/WebUI experiments, but generate.py does not yet build a stable Layered API workflow. "
+            "Open workflows/comfy/ui/qwen-image-layered.json in ComfyUI first."
+        )
     if provider == "comfy":
         with _comfy_generation_lock():
             if reference_images:
@@ -803,7 +808,7 @@ def generate_image(
         return _generate_image_minimax(prompt, reference_images, output_file, aspect_ratio)
     if provider in ("gemini", "google"):
         return _generate_image_gemini(prompt, reference_images, output_file, aspect_ratio)
-    raise ValueError(f"Unknown image provider: {provider!r} (use 'gemini', 'minimax', 'comfy', 'comfy_qwen_image', 'comfy_qwen_edit', or 'comfy_sd15')")
+    raise ValueError(f"Unknown image provider: {provider!r} (use 'gemini', 'minimax', 'comfy', 'comfy_qwen_image', 'comfy_qwen_edit', 'comfy_qwen_layered', or 'comfy_sd15')")
 
 
 if __name__ == "__main__":
@@ -817,7 +822,7 @@ if __name__ == "__main__":
     parser.add_argument("--aspect-ratio", required=False, default="16:9",
                         help="Aspect ratio of the generated image")
     parser.add_argument("--qwen-preset", choices=["fast", "balanced", "quality"], default=None,
-                        help="Qwen preset. Qwen Image defaults to quality; Qwen Image Edit defaults to balanced.")
+                        help="Qwen preset. Qwen Image defaults to quality; Qwen Image Edit 2509 defaults to balanced.")
     parser.add_argument("--qwen-steps", type=int, default=None, help="Qwen KSampler steps override")
     parser.add_argument("--qwen-cfg", type=float, default=None, help="Qwen KSampler CFG override")
     parser.add_argument("--qwen-denoise", type=float, default=None, help="Qwen KSampler denoise override")

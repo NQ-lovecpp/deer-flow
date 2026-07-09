@@ -10,12 +10,12 @@ services:
       network: host
       args:
         BASE_IMAGE: ${COMFYUI_BASE_IMAGE:-nvcr.io/nvidia/pytorch:25.11-py3}
-        COMFYUI_GIT_REF: ${COMFYUI_GIT_REF:-0c63b4f6}
-        COMFYUI_REPO_URL: ${COMFYUI_REPO_URL:-https://github.com/comfyanonymous/ComfyUI.git}
-        APT_MIRROR: ${APT_MIRROR:-}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        COMFYUI_GIT_REF: ${COMFYUI_GIT_REF:-0c63b4f6e3ce807a0f85c1826710bcf18ade3e2c}
+        COMFYUI_REPO_URL: ${COMFYUI_REPO_URL:-https://gitcode.com/gh_mirrors/co/ComfyUI.git}
+        APT_MIRROR: ${APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
         PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-}
-        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
     network_mode: host
     ipc: host
     shm_size: ${COMFYUI_SHM_SIZE:-16gb}

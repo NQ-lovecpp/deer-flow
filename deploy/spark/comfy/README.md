@@ -59,8 +59,14 @@ docker compose --env-file deploy/spark/comfy/.env \
   -f deploy/spark/comfy/compose.yaml config
 ```
 
-The build uses host networking so ComfyUI clone/install steps follow the same
-network path as the Spark host.
+The default build uses China-friendly sources: GitCode for the ComfyUI Git mirror
+and TUNA for apt/pip. It also uses host networking so clone/install steps follow
+the same network path as the Spark host. Switch `COMFYUI_REPO_URL` back to GitHub
+only if the mirror lags or misses a target commit.
+
+The Dockerfile keeps the CUDA/PyTorch stack from the NGC base image and filters
+`torch`, `torchvision`, and `torchaudio` out of ComfyUI `requirements.txt`. Do not
+let pip replace those packages unless you are deliberately changing CUDA stacks.
 
 Build the image:
 
@@ -143,6 +149,6 @@ docker compose --env-file deploy/spark/comfy/.env -f deploy/spark/comfy/compose.
 docker compose --env-file deploy/spark/comfy/.env -f deploy/spark/comfy/compose.yaml down
 ```
 
-The image is pinned by `COMFYUI_GIT_REF` for parity with the tested Spark host daemon.
-Set `COMFYUI_REPO_URL` to a mirror if GitHub is flaky, and set `COMFYUI_GIT_REF` to a
-newer commit or branch only when you are ready to rebuild and rerun Qwen smoke tests.
+The image is pinned by the full `COMFYUI_GIT_REF` SHA for parity with the tested
+Spark host daemon. Set it to a newer commit or branch only when you are ready to
+rebuild and rerun Qwen smoke tests.

@@ -3,12 +3,12 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.11-py3
 FROM ${BASE_IMAGE}
 
-ARG APT_MIRROR=
-ARG COMFYUI_GIT_REF=0c63b4f6
-ARG COMFYUI_REPO_URL=https://github.com/comfyanonymous/ComfyUI.git
-ARG PIP_INDEX_URL=
+ARG APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
+ARG COMFYUI_GIT_REF=0c63b4f6e3ce807a0f85c1826710bcf18ade3e2c
+ARG COMFYUI_REPO_URL=https://gitcode.com/gh_mirrors/co/ComfyUI.git
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_EXTRA_INDEX_URL=
-ARG PIP_TRUSTED_HOST=
+ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
@@ -65,7 +65,9 @@ RUN set -eux; \
     if [ -n "${PIP_INDEX_URL}" ]; then pip_args="$pip_args --index-url ${PIP_INDEX_URL}"; fi; \
     if [ -n "${PIP_EXTRA_INDEX_URL}" ]; then pip_args="$pip_args --extra-index-url ${PIP_EXTRA_INDEX_URL}"; fi; \
     if [ -n "${PIP_TRUSTED_HOST}" ]; then pip_args="$pip_args --trusted-host ${PIP_TRUSTED_HOST}"; fi; \
-    python3 -m pip install $pip_args -r requirements.txt; \
+    grep -Ev '^(torch|torchvision|torchaudio)([<>=~ ].*)?$' requirements.txt \
+      > /tmp/comfyui-requirements-no-torch.txt; \
+    python3 -m pip install $pip_args -r /tmp/comfyui-requirements-no-torch.txt; \
     mkdir -p models input output user custom_nodes temp; \
     chown -R 1000:1000 /app/ComfyUI
 

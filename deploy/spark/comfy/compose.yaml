@@ -1,0 +1,62 @@
+name: deer-flow-spark-comfy
+
+services:
+  comfyui:
+    image: ${COMFYUI_IMAGE:-deer-flow-spark-comfy:0c63b4f6}
+    container_name: ${COMFYUI_CONTAINER_NAME:-deer-flow-comfyui}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+      args:
+        BASE_IMAGE: ${COMFYUI_BASE_IMAGE:-nvcr.io/nvidia/pytorch:25.11-py3}
+        COMFYUI_GIT_REF: ${COMFYUI_GIT_REF:-0c63b4f6}
+        COMFYUI_REPO_URL: ${COMFYUI_REPO_URL:-https://github.com/comfyanonymous/ComfyUI.git}
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+    network_mode: host
+    ipc: host
+    shm_size: ${COMFYUI_SHM_SIZE:-16gb}
+    gpus: ${COMFYUI_GPUS:-all}
+    user: ${COMFYUI_UID:-1000}:${COMFYUI_GID:-1000}
+    stop_grace_period: 30s
+    restart: unless-stopped
+    cap_add:
+      - IPC_LOCK
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack: 67108864
+    environment:
+      COMFYUI_PORT: ${COMFYUI_PORT:-8188}
+      COMFYUI_EXTRA_ARGS: ${COMFYUI_EXTRA_ARGS:-}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - type: bind
+        source: ${COMFYUI_MODELS_DIR:-/home/chen/comfyui/ComfyUI/models}
+        target: /app/ComfyUI/models
+      - type: bind
+        source: ${COMFYUI_INPUT_DIR:-/home/chen/comfyui/ComfyUI/input}
+        target: /app/ComfyUI/input
+      - type: bind
+        source: ${COMFYUI_OUTPUT_DIR:-/home/chen/comfyui/ComfyUI/output}
+        target: /app/ComfyUI/output
+      - type: bind
+        source: ${COMFYUI_USER_DIR:-/home/chen/comfyui/ComfyUI/user}
+        target: /app/ComfyUI/user
+      - type: bind
+        source: ${COMFYUI_CUSTOM_NODES_DIR:-/home/chen/comfyui/ComfyUI/custom_nodes}
+        target: /app/ComfyUI/custom_nodes
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python3 -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('COMFYUI_PORT', '8188') + '/system_stats', timeout=3).read()"
+      interval: 20s
+      timeout: 5s
+      start_period: 30s
+      retries: 6

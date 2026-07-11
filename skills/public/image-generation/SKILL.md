@@ -1,161 +1,131 @@
 ---
 name: image-generation
-description: Use this skill when the user requests image generation, text-to-image, image editing, product/portrait/scene visuals, reference-image composition, or local ComfyUI/Qwen workflows. Defaults to local Qwen Image for generation and Qwen Image Edit 2509 for image modification, with Qwen Image Layered available as an explicit experimental workflow.
+description: Generate new images, edit or compose reference images, and create RGBA layer decompositions with local Qwen Image models on DGX Spark. Use for text-to-image, image modification, product or portrait visuals, multi-reference composition, foreground/background separation, editable layers, and ComfyUI image workflows. Always inspect the Spark resource policy before local work.
 ---
 
-# Image Generation Skill
+# Image Generation
 
-## Default Route
+## Route The Task
 
-Use local ComfyUI first unless the user explicitly asks for a remote provider.
+Use local ComfyUI unless the user explicitly requests a remote provider.
 
-- Text-to-image with no reference images: use Qwen Image 2512 through `IMAGE_GENERATION_PROVIDER=comfy` or `comfy_qwen_image`.
-- Image modification with one to three real reference images: use Qwen Image Edit 2509 through `IMAGE_GENERATION_PROVIDER=comfy` or `comfy_qwen_edit`.
-- Layer decomposition or layered generation: treat Qwen Image Layered as experimental. Use the bundled UI workflow in ComfyUI first; do not claim the CLI path is production-ready until `generate.py` has a layered API builder.
-- Do not use Qwen Image Edit with a blank dummy canvas for pure text-to-image. Omit `--reference-images` so the script routes to Qwen Image.
+| Request | Task | Model |
+|---|---|---|
+| Generate without reference images | `generate` | Qwen Image 2512 FP8 |
+| Modify or compose 1-3 reference images | `edit` | Qwen Image Edit 2509 FP8 |
+| Split foreground/background, produce RGBA layers, or request editable layers | `layered` | Qwen Image Layered FP8 mixed |
 
-Prefer plain `.txt` prompt files. JSON prompt files are accepted for compatibility, but local Qwen sampling controls must be CLI flags, not JSON fields.
+Use `--task auto` for normal work. It selects `edit` when reference images exist and `generate` otherwise. Use `--task layered` only for an explicit layer request. Never use Edit with a blank dummy canvas for text-to-image.
 
-## Required Preflight
+Treat Qwen Image Edit 2511 as an explicit compatibility fallback only. Do not select it automatically.
 
-Before local generation, inspect Spark/Comfy state:
+## Respect The Spark Contract
+
+Read [references/spark-runtime-policy.json](references/spark-runtime-policy.json) when exact machine or model data is needed.
+
+- Machine: NVIDIA DGX Spark, GB10 Grace Blackwell, 128GiB coherent unified memory.
+- Total AI memory budget: 90GiB.
+- Preserve at least 32GiB system-available memory.
+- Reserve 34GiB for `vllm_qwen36` and keep its policy `pinned`.
+- Never stop, restart, remove, or reconfigure vLLM for image work.
+- Keep at most one Comfy diffusion model resident. Reuse it for consecutive same-model jobs; release Comfy models before switching.
+- Treat Layered as low-priority and exclusive within Comfy. Release it after every job. Reject it when the budget is unavailable.
+- Keep Layered automatic jobs at 640px, batch 1, and at most 4 requested layers.
+
+The scripts enforce these rules. Do not bypass a rejected plan by changing environment variables or using `--memory-budget off`.
+
+## Inspect Before Running
+
+Run the scheduler before every local image task:
 
 ```bash
-COMFYUI_URL=http://127.0.0.1:8188 \
-  python /mnt/skills/public/image-generation/scripts/comfy_resource_status.py
+python /mnt/skills/public/image-generation/scripts/spark_image_scheduler.py \
+  status --json
 ```
 
-Scheduling rules:
-
-- Do not start a job when ComfyUI has a running or pending queue item unless the user explicitly asks for parallel generation.
-- Keep `--memory-budget balanced` by default.
-- Use `--memory-budget conservative` for batches, background work, or when free system RAM is below 56GiB.
-- Use `--memory-budget relaxed` only for one foreground high-quality job after checking the queue.
-- Use `--memory-budget off` only for debugging.
-
-Budget environment defaults enforced by `generate.py`:
-
-- `SPARK_IMAGE_MEMORY_BUDGET=balanced`
-- `SPARK_IMAGE_MIN_SYSTEM_FREE_GB=32`
-- `SPARK_IMAGE_LOW_SYSTEM_FREE_GB=56`
-- `SPARK_IMAGE_MAX_QUEUE_ITEMS=0`
-- `SPARK_IMAGE_LOCK=1`
-
-## Model Defaults
-
-Use these Spark defaults:
-
-- Qwen Image 2512 diffusion: `qwen_image_2512_fp8_e4m3fn.safetensors`
-- Qwen Image Edit 2509 diffusion: `qwen_image_edit_2509_fp8_e4m3fn.safetensors`
-- Qwen Image Edit 2509 Lightning LoRA for explicit fast previews: `Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors`
-- Qwen Image Layered diffusion: `qwen_image_layered_fp8mixed.safetensors`
-- Shared text encoder: `qwen_2.5_vl_7b_fp8_scaled.safetensors`
-- Standard VAE: `qwen_image_vae.safetensors`
-- Layered VAE: `qwen_image_layered_vae.safetensors`
-
-Prefer FP8-family weights on Spark. Use bf16 only for deliberate comparison or debugging. Treat 2511 as an explicit fallback via `COMFYUI_QWEN_UNET=qwen_image_edit_2511_fp8mixed.safetensors`, not the default edit route.
-
-## Generate A New Image
-
-Create a prompt file, then call `generate.py` without reference images:
+Plan a specific task when the route or budget is uncertain:
 
 ```bash
-cat > /mnt/user-data/workspace/image.txt <<'EOF'
-A cinematic product photo of a matte black espresso machine on a stainless counter, morning side light, realistic reflections, premium editorial photography, no text.
-EOF
+python /mnt/skills/public/image-generation/scripts/spark_image_scheduler.py \
+  plan --task generate --json
+```
 
+Proceed only when `admitted` is `true`. Report `rejection_reason` instead of retrying blindly. A missing vLLM metrics connection is diagnostic only; the scheduler still reserves its full 34GiB and never manipulates it.
+
+## Generate
+
+```bash
 IMAGE_GENERATION_PROVIDER=comfy \
-  python /mnt/skills/public/image-generation/scripts/generate.py \
-    --prompt-file /mnt/user-data/workspace/image.txt \
-    --output-file /mnt/user-data/outputs/image.png \
-    --aspect-ratio 4:3 \
-    --qwen-preset quality \
-    --memory-budget balanced
+python /mnt/skills/public/image-generation/scripts/generate.py \
+  --task generate \
+  --prompt-file /mnt/user-data/workspace/prompt.txt \
+  --output-file /mnt/user-data/outputs/image.png \
+  --aspect-ratio 4:3 \
+  --qwen-preset quality
 ```
 
-Qwen Image defaults: `quality` preset, about 50 steps, CFG 4.0, official Qwen Image dimensions for the requested aspect ratio.
+Default model: `qwen_image_2512_fp8_e4m3fn.safetensors`. Use `balanced` for routine iteration and `quality` for a final foreground job.
 
-## Edit Or Compose Images
+## Edit Or Compose
 
-Pass the main image as the first reference. Pass up to two more images as secondary references.
+Pass the primary image first and at most two secondary references.
 
 ```bash
-cat > /mnt/user-data/workspace/edit.txt <<'EOF'
-Replace the background with a clean bright kitchen. Keep the product shape, logo placement, camera angle, and realistic reflections unchanged.
-EOF
-
-IMAGE_GENERATION_PROVIDER=comfy_qwen_edit \
-  python /mnt/skills/public/image-generation/scripts/generate.py \
-    --prompt-file /mnt/user-data/workspace/edit.txt \
-    --reference-images /mnt/user-data/uploads/input.png \
-    --output-file /mnt/user-data/outputs/edited.png \
-    --aspect-ratio 4:3 \
-    --qwen-preset balanced \
-    --memory-budget balanced
+IMAGE_GENERATION_PROVIDER=comfy \
+python /mnt/skills/public/image-generation/scripts/generate.py \
+  --task edit \
+  --prompt-file /mnt/user-data/workspace/edit.txt \
+  --reference-images /mnt/user-data/uploads/input.png \
+  --output-file /mnt/user-data/outputs/edited.png \
+  --qwen-preset balanced
 ```
 
-For multi-image composition:
+Default model: `qwen_image_edit_2509_fp8_e4m3fn.safetensors`. Use the 2509 Lightning LoRA only for an explicitly requested fast preview.
+
+## Create Layers
+
+For decomposition, pass one source image. Without a reference image, Layered generates a layered image from text.
 
 ```bash
-IMAGE_GENERATION_PROVIDER=comfy_qwen_edit \
-  python /mnt/skills/public/image-generation/scripts/generate.py \
-    --prompt-file /mnt/user-data/workspace/composite.txt \
-    --reference-images /mnt/user-data/uploads/person.jpg /mnt/user-data/uploads/product.png /mnt/user-data/uploads/scene.jpg \
-    --output-file /mnt/user-data/outputs/composite.png \
-    --qwen-preset balanced
+IMAGE_GENERATION_PROVIDER=comfy \
+python /mnt/skills/public/image-generation/scripts/generate.py \
+  --task layered \
+  --prompt-file /mnt/user-data/workspace/layers.txt \
+  --reference-images /mnt/user-data/uploads/input.png \
+  --output-file /mnt/user-data/outputs/layered.png \
+  --qwen-layers 3 \
+  --qwen-resolution 640 \
+  --qwen-preset balanced
 ```
 
-Qwen Image Edit 2509 defaults: `balanced` preset, 20 steps, CFG 4.0, denoise 1.0, 0.5MP input scaling, LoRA off. Use `--qwen-use-lora --qwen-preset fast` only for explicit quick preview experiments.
+The requested output is the reconstructed composite. Additional files use `.layer-01.png`, `.layer-02.png`, and so on. The `.layers.json` sidecar records the model, prompt id, mode, requested layer count, and every output path.
 
-## Layered Experiments
+Layer prompts describe the complete scene, including partially hidden content. They do not assign exact semantics to layer numbers.
 
-Use Qwen Image Layered only when the user asks for layers, decomposition, foreground/background separation, or editable layered outputs.
+## Useful Controls
 
-Current status:
-
-- Model files are listed in `workflows/comfy/model-manifest.json`.
-- The UI workflow is `workflows/comfy/ui/qwen-image-layered.json`.
-- The ComfyUI node `EmptyQwenImageLayeredLatentImage` is available on Spark.
-- The CLI script does not yet provide a stable layered API builder. If `IMAGE_GENERATION_PROVIDER=comfy_qwen_layered` is requested, report that the model should be tried through the bundled ComfyUI workflow first.
-
-## Controls
-
-Useful CLI controls:
-
+- `--task auto|generate|edit|layered`
+- `--dry-run`
 - `--qwen-preset fast|balanced|quality`
-- `--qwen-steps`
-- `--qwen-cfg`
-- `--qwen-denoise`
-- `--qwen-seed`
-- `--qwen-sampler`
-- `--qwen-scheduler`
-- `--qwen-shift`
-- `--qwen-megapixels`
-- `--qwen-weight-dtype`
-- `--qwen-use-lora` / `--qwen-no-lora`
-- `--qwen-lora-name`
-- `--qwen-lora-strength`
-- `--memory-budget off|relaxed|balanced|conservative`
+- `--qwen-steps`, `--qwen-cfg`, `--qwen-seed`
+- `--qwen-layers`, `--qwen-resolution`
+- `--qwen-use-lora`, `--qwen-no-lora`
+- `--memory-budget balanced|conservative|relaxed|off` controls quality conservation only; it never disables the 90GiB scheduler.
 
-Do not default to `fp8_e4m3fn_fast`; it has produced unstable colorful mosaic outputs on Spark. Use `weight_dtype=default` unless explicitly experimenting.
+Do not default to `fp8_e4m3fn_fast`; it has produced unstable mosaic output on Spark. Use `weight_dtype=default`.
 
-## Safety And Failure Modes
+## Failure Rules
 
-- Uploaded/reference files are usually under `/mnt/user-data/uploads/`.
-- Validate that the first reference image is the actual image to edit.
-- If more than three references are supplied, use the most relevant first three.
-- For strict removal of labels, stickers, watermarks, or large occluders, ask for or create a mask/inpaint workflow instead of relying on generic edit prompting.
-- Do not remove watermarks or copyright marks from third-party images.
-- If generation appears stuck, check `/queue`, `/system_stats`, and ComfyUI logs before retrying.
+- Do not queue parallel Comfy jobs.
+- If the queue is non-empty, wait and inspect it.
+- If memory is below policy, reduce Image/Edit resolution or reject Layered. Never reclaim vLLM.
+- For masks, strict object removal, or alpha repair, use a dedicated Comfy inpaint/composite workflow.
+- Do not remove third-party copyright marks or watermarks.
 
-## Bundled Resources
+## Bundled Tools
 
-- `scripts/generate.py`: provider routing, Qwen API workflow construction, Spark memory budget enforcement, and output download.
-- `scripts/comfy_resource_status.py`: queue, RAM, and VRAM snapshot.
-- `scripts/download_qwen_comfy_models.sh`: ModelScope model downloader.
-- `workflows/comfy/model-manifest.json`: model file manifest and target paths.
-- `workflows/comfy/ui/qwen-image-2512.json`: Qwen Image UI workflow.
-- `workflows/comfy/ui/qwen-image-edit-2509.json`: Qwen Image Edit 2509 UI workflow.
-- `workflows/comfy/ui/qwen-image-edit-2511.json`: optional 2511 fallback workflow reference.
-- `workflows/comfy/ui/qwen-image-layered.json`: Qwen Image Layered UI workflow.
-- `templates/doraemon.md`: read only for Doraemon comic-style requests.
+- `scripts/spark_image_scheduler.py`: machine status, task plan, and Comfy-only release.
+- `scripts/generate.py`: provider routing, enforced scheduling, Qwen workflows, and output download.
+- `scripts/comfy_resource_status.py`: compatibility wrapper for full scheduler status.
+- `workflows/comfy/model-manifest.json`: model files and storage paths.
+- `workflows/comfy/ui/`: editable ComfyUI workflows for Image, Edit, and Layered.

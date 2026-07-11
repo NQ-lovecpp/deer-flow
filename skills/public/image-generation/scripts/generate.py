@@ -11,6 +11,12 @@ from urllib.parse import urlencode
 
 import requests
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import spark_image_scheduler as spark_scheduler  # noqa: E402
+
 MINIMAX_DEFAULT_HOST = "https://api.minimaxi.com"
 COMFY_DEFAULT_HOST = "http://host.docker.internal:8188"
 # MiniMax image-01 caps the prompt at 1500 characters and rejects longer requests
@@ -27,6 +33,12 @@ QWEN_IMAGE_PRESETS = {
     "fast": {"steps": 4, "cfg": 1.0, "weight_dtype": "default", "use_lora": False},
     "balanced": {"steps": 30, "cfg": 4.0, "weight_dtype": "default", "use_lora": False},
     "quality": {"steps": 50, "cfg": 4.0, "weight_dtype": "default", "use_lora": False},
+}
+
+QWEN_LAYERED_PRESETS = {
+    "fast": {"steps": 20, "cfg": 2.5},
+    "balanced": {"steps": 30, "cfg": 3.0},
+    "quality": {"steps": 50, "cfg": 4.0},
 }
 
 QWEN_IMAGE_DIMENSIONS = {
@@ -490,7 +502,10 @@ def _apply_spark_memory_budget(kind: str, opts: dict, options: dict | None, aspe
         raise RuntimeError(f"ComfyUI queue has {queued} item(s), above budget {max_queue}; wait or raise SPARK_IMAGE_MAX_QUEUE_ITEMS")
 
     ram_free_gb = _gb(snapshot["ram_free"])
-    min_free_gb = _float_env("SPARK_IMAGE_MIN_SYSTEM_FREE_GB", 32.0)
+    min_free_gb = _float_env(
+        "SPARK_SYSTEM_RESERVE_GIB",
+        _float_env("SPARK_IMAGE_MIN_SYSTEM_FREE_GB", 32.0),
+    )
     low_free_gb = _float_env("SPARK_IMAGE_LOW_SYSTEM_FREE_GB", 56.0)
     if ram_free_gb is not None and ram_free_gb < min_free_gb:
         raise MemoryError(f"Spark free RAM is {ram_free_gb:.1f}GiB, below budget minimum {min_free_gb:.1f}GiB")
@@ -511,6 +526,9 @@ def _apply_spark_memory_budget(kind: str, opts: dict, options: dict | None, aspe
         if should_conserve and not _option_or_env_set(options, "megapixels", ("COMFYUI_QWEN_MEGAPIXELS",)):
             opts["megapixels"] = min(float(opts["megapixels"] or 0.5), 0.35)
         if should_conserve and not _option_or_env_set(options, "steps", ("COMFYUI_QWEN_STEPS",)):
+            opts["steps"] = min(opts["steps"], 20)
+    elif kind == "qwen_layered":
+        if should_conserve and not _option_or_env_set(options, "steps", ("COMFYUI_QWEN_LAYERED_STEPS",)):
             opts["steps"] = min(opts["steps"], 20)
     return opts
 
@@ -699,7 +717,174 @@ def _build_comfy_qwen_edit_workflow(prompt: str, uploaded_images: list[str], qwe
     add("SaveImage", {"images": [decoded_id, 0], "filename_prefix": prefix})
     return workflow
 
-def _run_comfy_workflow(workflow: dict, output_file: str) -> str:
+
+def _resolve_qwen_layered_options(options: dict | None = None) -> dict:
+    policy = spark_scheduler.load_policy()
+    defaults = policy["tasks"]["layered"]
+    preset = (options or {}).get("preset") or os.getenv("COMFYUI_QWEN_LAYERED_PRESET", "balanced")
+    preset = str(preset).strip().lower()
+    if preset not in QWEN_LAYERED_PRESETS:
+        raise ValueError(f"Unknown Qwen Layered preset: {preset!r} (use fast, balanced, or quality)")
+    sampling = QWEN_LAYERED_PRESETS[preset]
+    resolution = _qwen_option(
+        options,
+        "resolution",
+        "COMFYUI_QWEN_LAYERED_RESOLUTION",
+        defaults["default_resolution"],
+        int,
+    )
+    layers = _qwen_option(
+        options,
+        "layers",
+        "COMFYUI_QWEN_LAYERED_LAYERS",
+        defaults["default_layers"],
+        int,
+    )
+    allow_large = _parse_bool(os.getenv("SPARK_LAYERED_ALLOW_LARGE", "0"))
+    if not allow_large and resolution > defaults["max_automatic_resolution"]:
+        raise ValueError(
+            f"Layered automatic resolution is limited to {defaults['max_automatic_resolution']}px; "
+            "set SPARK_LAYERED_ALLOW_LARGE=1 only for a supervised experiment"
+        )
+    if not allow_large and layers > defaults["max_automatic_layers"]:
+        raise ValueError(
+            f"Layered automatic output is limited to {defaults['max_automatic_layers']} layers; "
+            "set SPARK_LAYERED_ALLOW_LARGE=1 only for a supervised experiment"
+        )
+    if resolution < 16 or resolution % 16:
+        raise ValueError("Qwen Image Layered resolution must be at least 16 and divisible by 16")
+    if layers < 1:
+        raise ValueError("Qwen Image Layered requires at least one layer")
+    resolved = {
+        "preset": preset,
+        "unet": os.getenv("COMFYUI_QWEN_LAYERED_UNET", defaults["diffusion_model"]),
+        "clip": os.getenv("COMFYUI_QWEN_LAYERED_CLIP", defaults["text_encoder"]),
+        "vae": os.getenv("COMFYUI_QWEN_LAYERED_VAE", defaults["vae"]),
+        "weight_dtype": _qwen_option(options, "weight_dtype", "COMFYUI_QWEN_LAYERED_WEIGHT_DTYPE", "default", str),
+        "steps": _qwen_option(options, "steps", "COMFYUI_QWEN_LAYERED_STEPS", sampling["steps"], int),
+        "cfg": _qwen_option(options, "cfg", "COMFYUI_QWEN_LAYERED_CFG", sampling["cfg"], float),
+        "shift": _qwen_option(options, "shift", "COMFYUI_QWEN_LAYERED_SHIFT", 1.0, float),
+        "seed": _qwen_seed(options, "COMFYUI_QWEN_LAYERED_SEED"),
+        "sampler": _qwen_option(options, "sampler", "COMFYUI_QWEN_LAYERED_SAMPLER", "euler", str),
+        "scheduler": _qwen_option(options, "scheduler", "COMFYUI_QWEN_LAYERED_SCHEDULER", "simple", str),
+        "resolution": resolution,
+        "layers": layers,
+        "batch_size": 1,
+    }
+    return _apply_spark_memory_budget("qwen_layered", resolved, options, "layered")
+
+
+def _build_comfy_qwen_layered_workflow(
+    prompt: str,
+    uploaded_image: str | None,
+    qwen_options: dict | None = None,
+) -> tuple[dict, dict]:
+    opts = _resolve_qwen_layered_options(qwen_options)
+    workflow = {}
+    counter = 1
+
+    def add(class_type: str, inputs: dict) -> str:
+        nonlocal counter
+        node_id = str(counter)
+        counter += 1
+        workflow[node_id] = {"class_type": class_type, "inputs": inputs}
+        return node_id
+
+    unet_id = add("UNETLoader", {"unet_name": opts["unet"], "weight_dtype": opts["weight_dtype"]})
+    model_id = add("ModelSamplingAuraFlow", {"model": [unet_id, 0], "shift": opts["shift"]})
+    clip_id = add("CLIPLoader", {"clip_name": opts["clip"], "type": "qwen_image", "device": "default"})
+    vae_id = add("VAELoader", {"vae_name": opts["vae"]})
+    positive_id = add("CLIPTextEncode", {"text": prompt, "clip": [clip_id, 0]})
+    negative_id = add("CLIPTextEncode", {"text": "", "clip": [clip_id, 0]})
+
+    if uploaded_image:
+        load_id = add("LoadImage", {"image": uploaded_image})
+        scale_id = add(
+            "ImageScaleToMaxDimension",
+            {"image": [load_id, 0], "upscale_method": "lanczos", "largest_size": opts["resolution"]},
+        )
+        source_latent_id = add("VAEEncode", {"pixels": [scale_id, 0], "vae": [vae_id, 0]})
+        positive_id = add(
+            "ReferenceLatent",
+            {"conditioning": [positive_id, 0], "latent": [source_latent_id, 0]},
+        )
+        negative_id = add(
+            "ReferenceLatent",
+            {"conditioning": [negative_id, 0], "latent": [source_latent_id, 0]},
+        )
+        size_id = add("GetImageSize", {"image": [scale_id, 0]})
+        latent_inputs = {
+            "width": [size_id, 0],
+            "height": [size_id, 1],
+            "layers": opts["layers"],
+            "batch_size": 1,
+        }
+        mode = "image-to-layers"
+    else:
+        latent_inputs = {
+            "width": opts["resolution"],
+            "height": opts["resolution"],
+            "layers": opts["layers"],
+            "batch_size": 1,
+        }
+        mode = "text-to-layers"
+
+    latent_id = add("EmptyQwenImageLayeredLatentImage", latent_inputs)
+    sample_id = add(
+        "KSampler",
+        {
+            "model": [model_id, 0],
+            "seed": opts["seed"],
+            "steps": opts["steps"],
+            "cfg": opts["cfg"],
+            "sampler_name": opts["sampler"],
+            "scheduler": opts["scheduler"],
+            "positive": [positive_id, 0],
+            "negative": [negative_id, 0],
+            "latent_image": [latent_id, 0],
+            "denoise": 1.0,
+        },
+    )
+    batch_id = add("LatentCutToBatch", {"samples": [sample_id, 0], "dim": "t", "slice_size": 1})
+    decoded_id = add("VAEDecode", {"samples": [batch_id, 0], "vae": [vae_id, 0]})
+    prefix = f"deerflow_qwen_layered_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    add("SaveImage", {"images": [decoded_id, 0], "filename_prefix": prefix})
+    return workflow, {**opts, "mode": mode}
+
+
+def _download_comfy_images(images: list[dict], output_file: str) -> list[dict]:
+    host = _comfy_host()
+    downloaded = []
+    for index, image in enumerate(images):
+        query = urlencode(
+            {
+                "filename": image["filename"],
+                "subfolder": image.get("subfolder", ""),
+                "type": image.get("type", "output"),
+            }
+        )
+        response = requests.get(f"{host}/view?{query}", timeout=60)
+        response.raise_for_status()
+        if index == 0:
+            destination = Path(output_file)
+        else:
+            destination = Path(output_file).with_name(
+                f"{Path(output_file).stem}.layer-{index:02d}{Path(output_file).suffix or '.png'}"
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(response.content)
+        downloaded.append(
+            {
+                "index": index,
+                "role": "composite" if index == 0 else "rgba_layer",
+                "path": str(destination),
+                "comfy_filename": image["filename"],
+            }
+        )
+    return downloaded
+
+
+def _run_comfy_workflow_all(workflow: dict) -> tuple[str, list[dict]]:
     host = _comfy_host()
     client_id = f"deerflow-{uuid.uuid4().hex}"
     queued = requests.post(f"{host}/prompt", json={"prompt": workflow, "client_id": client_id}, timeout=30)
@@ -708,9 +893,9 @@ def _run_comfy_workflow(workflow: dict, output_file: str) -> str:
     deadline = time.time() + int(os.getenv("COMFYUI_TIMEOUT", "900"))
     history = None
     while time.time() < deadline:
-        resp = requests.get(f"{host}/history/{prompt_id}", timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        response = requests.get(f"{host}/history/{prompt_id}", timeout=30)
+        response.raise_for_status()
+        data = response.json()
         if prompt_id in data:
             history = data[prompt_id]
             break
@@ -721,19 +906,17 @@ def _run_comfy_workflow(workflow: dict, output_file: str) -> str:
     if status.get("status_str") == "error":
         messages = status.get("messages") or []
         raise Exception(f"ComfyUI workflow failed: {messages[-1] if messages else status}")
-    outputs = history.get("outputs") or {}
     images = []
-    for node in outputs.values():
+    for node in (history.get("outputs") or {}).values():
         images.extend(node.get("images") or [])
     if not images:
-        raise Exception(f"ComfyUI generated no images")
-    image = images[0]
-    query = urlencode({"filename": image["filename"], "subfolder": image.get("subfolder", ""), "type": image.get("type", "output")})
-    img_resp = requests.get(f"{host}/view?{query}", timeout=60)
-    img_resp.raise_for_status()
-    _ensure_output_dir(output_file)
-    Path(output_file).write_bytes(img_resp.content)
-    return image["filename"]
+        raise Exception("ComfyUI generated no images")
+    return prompt_id, images
+
+def _run_comfy_workflow(workflow: dict, output_file: str) -> str:
+    _, images = _run_comfy_workflow_all(workflow)
+    downloaded = _download_comfy_images(images[:1], output_file)
+    return downloaded[0]["comfy_filename"]
 
 
 
@@ -765,6 +948,70 @@ def _generate_image_comfy_qwen_image(prompt: str, reference_images: list[str], o
     return f"Successfully generated image to {output_file} via local Qwen Image 2512 preset={preset} ({filename})"
 
 
+def _generate_image_comfy_qwen_layered(
+    prompt: str,
+    reference_images: list[str],
+    output_file: str,
+    qwen_options: dict | None = None,
+) -> str:
+    prompt_text, _ = _comfy_prompt_text(prompt)
+    if len(reference_images) > 1:
+        print("Warning: Qwen Image Layered decomposition uses only the first reference image.")
+    uploaded_image = _comfy_upload_image(reference_images[0]) if reference_images else None
+    workflow, opts = _build_comfy_qwen_layered_workflow(prompt_text, uploaded_image, qwen_options=qwen_options)
+    prompt_id, images = _run_comfy_workflow_all(workflow)
+    downloaded = _download_comfy_images(images, output_file)
+    manifest_path = Path(output_file).with_name(f"{Path(output_file).stem}.layers.json")
+    manifest = {
+        "prompt_id": prompt_id,
+        "task": "layered",
+        "mode": opts["mode"],
+        "model": opts["unet"],
+        "layers_requested": opts["layers"],
+        "resolution": opts["resolution"],
+        "files": downloaded,
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return (
+        f"Successfully generated {len(downloaded) - 1} RGBA layer(s) plus composite via local "
+        f"Qwen Image Layered; manifest={manifest_path}"
+    )
+
+
+def _resolve_local_task(task: str, reference_images: list[str]) -> str:
+    normalized = str(task or "auto").strip().lower()
+    if normalized == "auto":
+        return "edit" if reference_images else "generate"
+    if normalized not in {"generate", "edit", "layered"}:
+        raise ValueError("task must be auto, generate, edit, or layered")
+    if normalized == "edit" and not reference_images:
+        raise ValueError("The edit task requires at least one reference image")
+    return normalized
+
+
+def _prepare_spark_task(task: str, dry_run: bool = False) -> dict:
+    schedule = spark_scheduler.plan(task, comfy_url=_comfy_host())
+    print(
+        "Spark schedule: "
+        f"task={task}, admitted={schedule['admitted']}, resident={schedule['resident_model'] or 'none'}, "
+        f"combined={schedule['estimated_reservation_gib']['combined_gib']:.1f}GiB/"
+        f"{schedule['budget']['ai_memory_gib']:.1f}GiB, actions={','.join(schedule['required_actions']) or 'none'}"
+    )
+    if not schedule["admitted"]:
+        raise MemoryError(schedule["rejection_reason"] or "Spark image task was rejected by resource policy")
+    if not dry_run and "release_comfy_before_load" in schedule["required_actions"]:
+        spark_scheduler.release_comfy(comfy_url=_comfy_host())
+        time.sleep(1)
+    return schedule
+
+
+def _release_layered_models() -> None:
+    try:
+        spark_scheduler.release_comfy(comfy_url=_comfy_host())
+    except Exception as exc:
+        print(f"Warning: unable to release Layered models after the job: {exc}", file=sys.stderr)
+
+
 def _generate_image_comfy_sd15(prompt: str, reference_images: list[str], output_file: str, aspect_ratio: str) -> str:
     if reference_images:
         print("Warning: local ComfyUI SD1.5 provider currently ignores reference images.")
@@ -779,28 +1026,63 @@ def generate_image(
     output_file: str,
     aspect_ratio: str = "16:9",
     qwen_options: dict | None = None,
+    task: str = "auto",
+    dry_run: bool = False,
 ) -> str:
     with open(prompt_file, "r", encoding="utf-8") as f:
         prompt = f.read()
     provider = _resolve_provider(
         "IMAGE_GENERATION_PROVIDER", "gemini", bool(os.getenv("GEMINI_API_KEY"))
     )
+    provider_tasks = {
+        "comfy_qwen_image": "generate",
+        "qwen_image": "generate",
+        "qwen-image": "generate",
+        "comfy_qwen_edit": "edit",
+        "qwen_image_edit": "edit",
+        "qwen-edit": "edit",
+        "comfy_qwen_layered": "layered",
+        "qwen_image_layered": "layered",
+        "qwen-layered": "layered",
+    }
+    explicit_provider_task = provider_tasks.get(provider)
+    selected_task = _resolve_local_task(task, reference_images)
+    if explicit_provider_task and task not in (None, "", "auto") and selected_task != explicit_provider_task:
+        raise ValueError(f"Provider {provider!r} conflicts with --task {selected_task!r}")
+    if explicit_provider_task:
+        selected_task = explicit_provider_task
+
+    if dry_run and (provider == "comfy" or explicit_provider_task):
+        with _comfy_generation_lock():
+            return json.dumps(_prepare_spark_task(selected_task, dry_run=True), ensure_ascii=False, indent=2)
     if provider in ("comfy_qwen_edit", "qwen_image_edit", "qwen-edit"):
         with _comfy_generation_lock():
+            _prepare_spark_task("edit")
             return _generate_image_comfy_qwen_edit(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
     if provider in ("comfy_qwen_image", "qwen_image", "qwen-image"):
         with _comfy_generation_lock():
+            _prepare_spark_task("generate")
             return _generate_image_comfy_qwen_image(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
     if provider in ("comfy_qwen_layered", "qwen_image_layered", "qwen-layered"):
-        raise NotImplementedError(
-            "Qwen Image Layered is installed for ComfyUI/WebUI experiments, but generate.py does not yet build a stable Layered API workflow. "
-            "Open workflows/comfy/ui/qwen-image-layered.json in ComfyUI first."
-        )
+        with _comfy_generation_lock():
+            schedule = _prepare_spark_task("layered")
+            try:
+                return _generate_image_comfy_qwen_layered(prompt, reference_images, output_file, qwen_options=qwen_options)
+            finally:
+                if "release_comfy_after_job" in schedule["required_actions"]:
+                    _release_layered_models()
     if provider == "comfy":
         with _comfy_generation_lock():
-            if reference_images:
+            schedule = _prepare_spark_task(selected_task)
+            if selected_task == "edit":
                 return _generate_image_comfy_qwen_edit(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
-            return _generate_image_comfy_qwen_image(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
+            if selected_task == "generate":
+                return _generate_image_comfy_qwen_image(prompt, reference_images, output_file, aspect_ratio, qwen_options=qwen_options)
+            try:
+                return _generate_image_comfy_qwen_layered(prompt, reference_images, output_file, qwen_options=qwen_options)
+            finally:
+                if "release_comfy_after_job" in schedule["required_actions"]:
+                    _release_layered_models()
     if provider in ("comfy_sd15", "sd15", "sd-1.5"):
         with _comfy_generation_lock():
             return _generate_image_comfy_sd15(prompt, reference_images, output_file, aspect_ratio)
@@ -821,6 +1103,10 @@ if __name__ == "__main__":
     parser.add_argument("--output-file", required=True, help="Output path for generated image")
     parser.add_argument("--aspect-ratio", required=False, default="16:9",
                         help="Aspect ratio of the generated image")
+    parser.add_argument("--task", choices=["auto", "generate", "edit", "layered"], default="auto",
+                        help="Local Qwen task. Auto selects edit when references exist, otherwise generate.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the Spark scheduling decision without queueing a ComfyUI workflow")
     parser.add_argument("--qwen-preset", choices=["fast", "balanced", "quality"], default=None,
                         help="Qwen preset. Qwen Image defaults to quality; Qwen Image Edit 2509 defaults to balanced.")
     parser.add_argument("--qwen-steps", type=int, default=None, help="Qwen KSampler steps override")
@@ -832,6 +1118,10 @@ if __name__ == "__main__":
     parser.add_argument("--qwen-shift", type=float, default=None, help="Qwen ModelSamplingAuraFlow shift override")
     parser.add_argument("--qwen-megapixels", type=float, default=None,
                         help="Optional pre-scale megapixels before Qwen conditioning/VAE. Defaults come from the selected preset.")
+    parser.add_argument("--qwen-layers", type=int, default=None,
+                        help="Qwen Image Layered RGBA layer count; automatic jobs are capped at 4")
+    parser.add_argument("--qwen-resolution", type=int, default=None,
+                        help="Qwen Image Layered maximum dimension; automatic jobs default to and are capped at 640")
     parser.add_argument("--qwen-weight-dtype", default=None,
                         help="Qwen UNETLoader weight_dtype override. Defaults to 'default'; use fp8_e4m3fn_fast only as an explicit preview/experimental choice.")
     parser.add_argument("--qwen-lora-name", default=None, help="Qwen Lightning LoRA filename override")
@@ -855,6 +1145,8 @@ if __name__ == "__main__":
         "scheduler": args.qwen_scheduler,
         "shift": args.qwen_shift,
         "megapixels": args.qwen_megapixels,
+        "layers": args.qwen_layers,
+        "resolution": args.qwen_resolution,
         "weight_dtype": args.qwen_weight_dtype,
         "lora_name": args.qwen_lora_name,
         "lora_strength": args.qwen_lora_strength,
@@ -865,7 +1157,9 @@ if __name__ == "__main__":
     try:
         print(generate_image(args.prompt_file, args.reference_images,
                              args.output_file, args.aspect_ratio,
-                             qwen_options=qwen_options))
+                             qwen_options=qwen_options,
+                             task=args.task,
+                             dry_run=args.dry_run))
     except Exception as e:
         print(f"Error while generating image: {e}")
         sys.exit(1)

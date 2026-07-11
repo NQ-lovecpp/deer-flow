@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "machine": {
+    "name": "NVIDIA DGX Spark",
+    "accelerator": "NVIDIA GB10 Grace Blackwell",
+    "memory_architecture": "coherent unified memory",
+    "unified_memory_gib": 128
+  },
+  "budget": {
+    "ai_memory_gib": 90,
+    "system_reserve_gib": 32,
+    "max_resident_image_dits": 1
+  },
+  "vllm": {
+    "service": "vllm_qwen36",
+    "model": "Qwen3.6-35B-A3B-NVFP4",
+    "policy": "pinned",
+    "reserved_gib": 34,
+    "metrics_urls": [
+      "http://host.docker.internal:14002/metrics",
+      "http://127.0.0.1:14002/metrics"
+    ]
+  },
+  "comfy": {
+    "released_detection": {
+      "min_ram_available_gib": 70,
+      "min_vram_free_gib": 24
+    }
+  },
+  "tasks": {
+    "generate": {
+      "description": "Text-to-image generation without reference images",
+      "provider": "comfy_qwen_image",
+      "model_family": "qwen-image-2512",
+      "diffusion_model": "qwen_image_2512_fp8_e4m3fn.safetensors",
+      "text_encoder": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "vae": "qwen_image_vae.safetensors",
+      "precision": "fp8_e4m3fn",
+      "reservation_gib": 42,
+      "exclusive": false
+    },
+    "edit": {
+      "description": "Modify or compose one to three reference images",
+      "provider": "comfy_qwen_edit",
+      "model_family": "qwen-image-edit-2509",
+      "diffusion_model": "qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+      "text_encoder": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "vae": "qwen_image_vae.safetensors",
+      "precision": "fp8_e4m3fn",
+      "reservation_gib": 44,
+      "exclusive": false,
+      "max_reference_images": 3
+    },
+    "layered": {
+      "description": "RGBA layer decomposition or explicit layered generation",
+      "provider": "comfy_qwen_layered",
+      "model_family": "qwen-image-layered",
+      "diffusion_model": "qwen_image_layered_fp8mixed.safetensors",
+      "text_encoder": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "vae": "qwen_image_layered_vae.safetensors",
+      "precision": "fp8mixed",
+      "reservation_gib": 52,
+      "exclusive": true,
+      "default_resolution": 640,
+      "max_automatic_resolution": 640,
+      "default_layers": 3,
+      "max_automatic_layers": 4,
+      "batch_size": 1
+    }
+  }
+}

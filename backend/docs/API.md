@@ -86,7 +86,7 @@ Content-Type: application/json
     ]
   },
   "config": {
-    "recursion_limit": 100,
+    "recursion_limit": 1000,
     "configurable": {
       "model_name": "gpt-4",
       "thinking_enabled": false,
@@ -694,13 +694,13 @@ curl -X POST http://localhost:2026/api/langgraph/threads/abc123/runs \
   -d '{
     "input": {"messages": [{"role": "user", "content": "Hello"}]},
     "config": {
-      "recursion_limit": 100,
+      "recursion_limit": 1000,
       "configurable": {"model_name": "gpt-4"}
     }
   }'
 ```
 
-> The unified Gateway path defaults `config.recursion_limit` to 100 for
+> The unified Gateway path defaults `config.recursion_limit` to 1000 for
 > plan-mode and subagent-heavy runs. Clients may still set
 > `config.recursion_limit` explicitly — see the [Create Run](#create-run)
 > section for details.

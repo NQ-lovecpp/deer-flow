@@ -223,7 +223,7 @@ def test_build_run_config_basic():
 
     config = build_run_config("thread-1", None, None)
     assert config["configurable"]["thread_id"] == "thread-1"
-    assert config["recursion_limit"] == 100
+    assert config["recursion_limit"] == 1000
 
 
 def test_build_run_config_with_overrides():
@@ -276,6 +276,19 @@ def test_build_run_config_ceiling_is_configurable(_stub_app_config):
     set_app_config(AppConfig.model_validate({"sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"}, "max_recursion_limit": 300}))
     try:
         config = build_run_config("thread-1", {"recursion_limit": 100_000_000}, None)
+        assert config["recursion_limit"] == 300
+    finally:
+        reset_app_config()
+
+
+def test_build_run_config_default_respects_configured_ceiling(_stub_app_config):
+    """The server default must not exceed a lower operator-configured ceiling."""
+    from app.gateway.services import build_run_config
+    from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
+
+    set_app_config(AppConfig.model_validate({"sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"}, "max_recursion_limit": 300}))
+    try:
+        config = build_run_config("thread-1", None, None)
         assert config["recursion_limit"] == 300
     finally:
         reset_app_config()
@@ -1119,7 +1132,7 @@ def test_build_run_config_with_context():
     assert config["context"]["thread_id"] == "thread-1"
     # configurable carries thread_id for the checkpointer; user context stays in context.
     assert config["configurable"] == {"thread_id": "thread-1"}
-    assert config["recursion_limit"] == 100
+    assert config["recursion_limit"] == 1000
 
 
 def test_build_run_config_context_injects_thread_id():

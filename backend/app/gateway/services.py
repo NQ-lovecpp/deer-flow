@@ -338,7 +338,7 @@ def resolve_agent_factory(assistant_id: str | None):
 # call), enabling runaway API cost / DoS. ``_DEFAULT_RECURSION_LIMIT`` is the
 # server default when the client sends nothing; the hard ceiling any client
 # value is clamped to is configurable via ``AppConfig.max_recursion_limit``.
-_DEFAULT_RECURSION_LIMIT = 100
+_DEFAULT_RECURSION_LIMIT = 1000
 _DEFAULT_MAX_RECURSION_LIMIT = 1000
 
 
@@ -363,7 +363,7 @@ def _clamp_recursion_limit(value: Any, max_limit: int) -> int:
     capped at ``max_limit`` (from ``AppConfig.max_recursion_limit``).
     """
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return _DEFAULT_RECURSION_LIMIT
+        return min(_DEFAULT_RECURSION_LIMIT, max_limit)
     return min(value, max_limit)
 
 
@@ -394,9 +394,9 @@ def build_run_config(
     # Lead-agent recursion budget (LangGraph super-steps for the lead graph
     # only). Independent of subagent depth: a `task()` dispatch runs the whole
     # subagent inside ONE lead tools-node step, and subagents enforce their own
-    # limit via `subagents.max_turns`. Do not conflate this 100 with the
+    # limit via `subagents.max_turns`. Do not conflate this 1000 with the
     # general-purpose subagent's max_turns.
-    config: dict[str, Any] = {"recursion_limit": _DEFAULT_RECURSION_LIMIT}
+    config: dict[str, Any] = {"recursion_limit": min(_DEFAULT_RECURSION_LIMIT, _resolve_max_recursion_limit())}
     if request_config:
         # LangGraph >= 0.6.0 introduced ``context`` as the preferred way to
         # pass thread-level data and rejects requests that include both
